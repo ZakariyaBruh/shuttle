@@ -12,6 +12,7 @@ ap.add_argument("--base", default=BASE)
 ap.add_argument("--out", default="outputs/cryptobro-lora")
 ap.add_argument("--epochs", type=float, default=2)
 ap.add_argument("--lr", type=float, default=1e-4)
+ap.add_argument("--push-to", help="Hub repo id to upload the adapter to, e.g. user/CryptoBro (needs HF_TOKEN). Off by default.")
 args = ap.parse_args()
 
 tok = load_tokenizer(args.base)
@@ -44,3 +45,7 @@ Trainer(
 model.save_pretrained(args.out)
 tok.save_pretrained(args.out)
 print("saved adapter to", args.out)
+if args.push_to:
+    model.push_to_hub(args.push_to)
+    tok.push_to_hub(args.push_to)
+    print("pushed to", args.push_to)

@@ -39,15 +39,13 @@ def load_with_adapter(adapter_dir, base=BASE):
 
 
 @torch.no_grad()
-def p_buy(model, tok, prompts, batch=8):
-    """Probability of BUY (vs SELL) from the first answer token's logits."""
-    buy, sell = (tok.encode(w, add_special_tokens=False)[0] for w in ("BUY", "SELL"))
-    assert buy != sell
+def generate(model, tok, prompts, batch=8, max_new_tokens=48):
+    """Greedy answers in the BUY HERE / SELL HERE / PROFIT PREDICTION format."""
     tok.padding_side = "left"
     out = []
     for i in range(0, len(prompts), batch):
         enc = tok([chat(tok, p) for p in prompts[i : i + batch]], return_tensors="pt", padding=True).to(model.device)
-        logits = model(**enc).logits[:, -1, :].float()
-        out += torch.softmax(logits[:, [buy, sell]], dim=-1)[:, 0].cpu().tolist()
+        gen = model.generate(**enc, max_new_tokens=max_new_tokens, do_sample=False, pad_token_id=tok.pad_token_id)
+        out += tok.batch_decode(gen[:, enc.input_ids.shape[1] :], skip_special_tokens=True)
     tok.padding_side = "right"
     return out

@@ -7,3 +7,4 @@ transformers>=4.44
 peft>=0.12
 bitsandbytes
 accelerate
+gradio
