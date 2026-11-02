@@ -17,8 +17,8 @@ if (NOT EXISTS ${SDK})
 endif()
 
 set(CMAKE_CONFIGURATION_TYPES "Debug;Release")
-set(PLAYDATE_GAME_NAME tuner)
-set(PLAYDATE_GAME_DEVICE tuner_DEVICE)
+set(PLAYDATE_GAME_NAME airwave)
+set(PLAYDATE_GAME_DEVICE airwave_DEVICE)
 project(${PLAYDATE_GAME_NAME} C ASM)
 
 set(SRC src/main.c src/net.c src/parse.c)

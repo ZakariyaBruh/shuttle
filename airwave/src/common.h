@@ -28,6 +28,7 @@ struct Req {
 	char url[URL_MAX];
 	char loc[URL_MAX];     /* Location header of the last reply */
 	int redirects;
+	char* postBody; size_t postLen;        /* POST when set (kept for retries) */
 	/* buffered mode */
 	char* buf;
 	size_t len, cap, max;
@@ -46,6 +47,7 @@ struct Req {
 };
 
 Req* net_get(const char* url, size_t maxBytes, ReqDone done, void* ud);
+Req* net_post(const char* url, const char* jsonBody, size_t maxBytes, ReqDone done, void* ud);
 Req* net_stream(const char* url, size_t ringBytes);
 void net_update(void);                 /* call every frame */
 void net_free(Req* r);                 /* cancels if still running */
@@ -57,6 +59,8 @@ typedef struct { const char* s; size_t n; } Span;
 const char* json_next_object(const char** cursor, const char* end, Span* obj);
 const char* json_array_start(const char* json, const char* arrayKey);
 bool json_get_str(Span obj, const char* key, char* out, size_t outsz);
+bool json_get_text(Span obj, const char* key, char* out, size_t outsz);   /* like json_get_str but keeps \n */
+bool json_get_obj(Span obj, const char* key, Span* out);
 long json_get_int(Span obj, const char* key, long dflt);
 
 bool rss_next_item(const char** cursor, Span* item);

@@ -1,38 +1,39 @@
 #!/usr/bin/env python3
-"""Tuner relay: turns things the Playdate can't play (AAC, HLS, IPTV, TuneIn) into small MP3 streams.
+"""Airwave relay: turns things the Playdate can't play (AAC, HLS, TV video, YouTube...) into small MP3 / dithered-video streams.
 
-    python3 relay.py [--host 0.0.0.0] [--port 8787] [--m3u https://example.com/playlist.m3u] [--token SECRET]
+    python3 relay.py [--host 0.0.0.0] [--port 8787] [--m3u PLAYLIST_URL_OR_FILE ...] [--token SECRET] [--yt-cookies cookies.txt]
 
-Needs ffmpeg on PATH. By default it only listens on this computer (127.0.0.1, fine for the simulator).
-For a real Playdate pass --host 0.0.0.0 so it is reachable on your Wi-Fi, and put "<computer-ip>:8787" in the
-app's Data/settings.json. The relay fetches any URL it is asked to, so only expose it on a network you trust.
-To reach it from anywhere with no account or key, run a Cloudflare quick tunnel next to it:
+Needs ffmpeg and numpy (video dithering). Optional: yt-dlp + node (or deno) for YouTube playback. By default it only
+listens on this computer (127.0.0.1, fine for the simulator). For a real Playdate pass --host 0.0.0.0 so it is reachable on
+your Wi-Fi, and put "<computer-ip>:8787" in the app's Data/settings.json. The relay fetches any URL it is asked to, so only
+expose it on a network you trust. To reach it from anywhere with no account or key, run a Cloudflare quick tunnel next to it:
     cloudflared tunnel --url http://localhost:8787      # prints https://something.trycloudflare.com
 and ALWAYS start the relay with --token SECRET when it is reachable from the internet (put the same "relay_token" in settings.json).
 
-Endpoints (all GET):
-  /t.mp3?u=<url>              transcode any audio URL (HLS/AAC/Icecast/...) to MP3
-  /bbc/<service>.mp3          BBC radio, e.g. bbc_radio_fourfm, resolved through radio-browser
-  /iptv/groups                JSON list of the playlist's groups
-  /iptv/channels?offset=&q=&group=   JSON list of channels from the --m3u playlist (search, paging)
-  /iptv/stream/<n>.mp3        audio of channel n
-  /iptv/video/<n>             dithered 1-bit video + audio of channel n in the Tuner stream format (see VIDEO below)
-  /tunein/browse, /tunein/search?q=   JSON lists from the TuneIn directory; /tunein/play?id=sNNN streams one
+Lists are JSON arrays of {"name", "path", "video"?, "kind"?}; "kind":"list" opens another list. Video paths return the stream
+format described under VIDEO below. Sources: your IPTV playlist(s), a few free live channels, official YouTube channels and
+search (yt-dlp), the Internet Archive, TuneIn, BBC, radio-browser transcodes, and a generic /t.mp3 transcoder.
 """
 import argparse
 import json
 import os
+import shutil
 import re
 import subprocess
 import sys
 import threading
 import time
 from collections import deque
+
+try:
+    import numpy as np
+except ImportError:        # video then falls back to ffmpeg's own Bayer dither
+    np = None
 import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-UA = {"User-Agent": "PlaydateTunerRelay/1.0"}
+UA = {"User-Agent": "AirwaveRelay/1.0"}
 RADIO_BROWSER = "https://de1.api.radio-browser.info/json/stations/search"
 BBC_NAMES = {
     "bbc_radio_one": "BBC Radio 1", "bbc_radio_two": "BBC Radio 2", "bbc_radio_three": "BBC Radio 3",
@@ -42,6 +43,23 @@ BBC_NAMES = {
 }
 CHANNELS = []      # [(name, url, group)] from the M3U
 TOKEN = None
+YT_COOKIES = None
+FREE_LIVE = [      # official free live streams (URLs change now and then; add your own with --m3u)
+    ("DW English", "https://dwamdstream102.akamaized.net/hls/live/2015525/dwstream102/index.m3u8"),
+    ("Al Jazeera English", "https://live-hls-apps-aje-fa.getaj.net/AJE/index.m3u8"),
+    ("Red Bull TV", "https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master.m3u8"),
+]
+# Official YouTube channels. Nat Geo Wild's own channel is now called "Nat Geo Animals"; the linear Nat Geo Wild TV channel is
+# pay-TV only and has no legal free stream.
+SHOWS = [
+    ("Nat Geo Wild (Nat Geo Animals)", "https://www.youtube.com/@NatGeoAnimals/videos"),
+    ("National Geographic", "https://www.youtube.com/@NatGeo/videos"),
+    ("BBC Earth", "https://www.youtube.com/@bbcearth/videos"),
+    ("DW Documentary", "https://www.youtube.com/@DWDocumentary/videos"),
+    ("Smithsonian Channel", "https://www.youtube.com/@SmithsonianChannel/videos"),
+    ("NASA", "https://www.youtube.com/@NASA/videos"),
+]
+_media_cache = {}
 _bbc_cache = {}
 
 
@@ -99,6 +117,85 @@ def tunein_stream(station_id):
     raise ValueError("no stream for station")
 
 
+def _cached(key, fn, ttl=600):
+    hit = _media_cache.get(key)
+    if hit and time.time() - hit[0] < ttl:
+        return hit[1]
+    val = fn()
+    _media_cache[key] = (time.time(), val)
+    return val
+
+
+def ytdlp(args, timeout=60):
+    cmd = [sys.executable, "-m", "yt_dlp", "--no-warnings", *args]
+    if shutil.which("node"):
+        cmd[3:3] = ["--js-runtimes", "node"]
+    elif shutil.which("deno"):
+        cmd[3:3] = ["--js-runtimes", "deno"]
+    if YT_COOKIES:
+        cmd[3:3] = ["--cookies", YT_COOKIES]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode and not r.stdout.strip():
+        raise RuntimeError(r.stderr.strip().splitlines()[-1][:160] if r.stderr.strip() else "yt-dlp failed")
+    return r.stdout
+
+
+def fmt_duration(sec):
+    if not sec:
+        return ""
+    sec = int(sec)
+    return f" ({sec // 3600}h{sec % 3600 // 60:02d})" if sec >= 3600 else f" ({sec // 60}m)"
+
+
+def yt_list(target, n=30):
+    """Flat listing of a channel URL or a 'ytsearchN:...' query -> list items."""
+    out = []
+    for line in ytdlp(["--flat-playlist", "--playlist-end", str(n), "-j", target]).splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        vid = d.get("id", "")
+        if not re.fullmatch(r"[\w-]{11}", vid):
+            continue
+        out.append({"name": d.get("title", vid) + fmt_duration(d.get("duration")), "path": f"/yt/audio/{vid}", "video": f"/yt/video/{vid}"})
+    return out
+
+
+def yt_media_url(vid):
+    def resolve():
+        # a small progressive stream is enough for a 400x240 1-bit screen
+        out = ytdlp(["-g", "-f", "best[height<=480]/b", f"https://www.youtube.com/watch?v={vid}"], 90)
+        return out.strip().splitlines()[0]
+    return _cached(("yt", vid), resolve, 900)
+
+
+def ia_list(query, page=1):
+    q = f"({query}) AND mediatype:movies"
+    url = ("https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(
+        [("q", q), ("fl[]", "identifier"), ("fl[]", "title"), ("rows", 30), ("page", page), ("sort[]", "downloads desc"), ("output", "json")]))
+    docs = json.loads(fetch(url))["response"]["docs"]
+    items = [{"name": d.get("title", d["identifier"])[:90], "path": f"/ia/audio/{d['identifier']}", "video": f"/ia/video/{d['identifier']}"} for d in docs]
+    if len(docs) == 30:
+        items.append({"name": "More...", "path": "/ia/search?" + urllib.parse.urlencode({"q": query, "page": page + 1}), "kind": "list"})
+    return items
+
+
+def ia_media_url(ident):
+    def resolve():
+        files = json.loads(fetch(f"https://archive.org/metadata/{urllib.parse.quote(ident)}"))["files"]
+        vids = [f for f in files if f["name"].lower().endswith((".mp4", ".m4v", ".ogv", ".mkv", ".webm"))]
+        if not vids:
+            raise ValueError("no video file in this item")
+        vids.sort(key=lambda f: (not f["name"].lower().endswith(".mp4"), int(f.get("size", 0) or 0)))   # prefer mp4, then smallest
+        return f"https://archive.org/download/{urllib.parse.quote(ident)}/{urllib.parse.quote(vids[0]['name'])}"
+    return _cached(("ia", ident), resolve, 3600)
+
+
+def free_list(prefix, rows):
+    return [{"name": n, "path": f"/{prefix}/audio/{i}", "video": f"/{prefix}/video/{i}"} for i, (n, _) in enumerate(rows)]
+
+
 def net_input_opts(src, reconnect=True):
     """HTTP-only input options (a local file in the M3U would reject them)."""
     if not src.startswith("http"):
@@ -112,7 +209,7 @@ def ffmpeg_cmd(src):
 
 
 # ---------------------------------------------------------------------------------------------------------------------
-# VIDEO. The Playdate's 400x240 1-bit screen is 52 bytes per row (50 used). ffmpeg dithers to 1 bit (ordered/Bayer dither,
+# VIDEO. The Playdate's 400x240 1-bit screen is 52 bytes per row (50 used). we dither to 1 bit with a static ordered dither (interleaved gradient noise,
 # which stays still between frames so frame deltas compress well); we XOR each frame against the previous one, PackBits it,
 # and interleave it with MP3 audio chunks:
 #     packet = type:u8  len:u16le  payload
@@ -121,7 +218,8 @@ def ffmpeg_cmd(src):
 # ---------------------------------------------------------------------------------------------------------------------
 W, H, STRIDE, FPS = 400, 240, 52, 15
 SRC_ROW = W // 8
-KEY_EVERY = 60
+KEY_EVERY = 90
+DITHER = "ign"
 
 
 def packbits(data):
@@ -147,23 +245,48 @@ def packbits(data):
     return bytes(out)
 
 
+def _thresholds():
+    """Static per-pixel thresholds (0..1). A pattern that never changes keeps still areas still, so frame deltas stay small."""
+    y, x = np.mgrid[0:H, 0:W]
+    if DITHER == "bayer":
+        m = np.array([[0]])
+        for _ in range(3):
+            m = np.block([[4 * m, 4 * m + 2], [4 * m + 3, 4 * m + 1]])
+        return ((m + 0.5) / 64)[y % 8, x % 8]
+    # interleaved gradient noise: blue-noise-like spectrum, no visible grid, no setup cost
+    return (52.9829189 * ((0.06711056 * x + 0.00583715 * y) % 1.0)) % 1.0
+
+
 def video_filter():
-    return (f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,"
-            f"format=gray,eq=gamma=1.35:contrast=1.15")
+    pre = (f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,format=gray,"
+           # stable auto-contrast (smoothed over time), light denoise (less flicker), then sharpen so detail survives 1 bit
+           "normalize=blackpt=black:whitept=white:smoothing=15,hqdn3d=1.5:1.5:5:5,unsharp=5:5:1.0:5:5:0.0,eq=gamma=1.05")
+    return pre
 
 
 def video_cmd(src, audio_fd):
+    fmt = ["-pix_fmt", "gray", "-f", "rawvideo"] if np is not None else ["-sws_dither", "bayer", "-pix_fmt", "monob", "-f", "rawvideo"]
+    vf = video_filter() if np is not None else f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,format=gray,eq=gamma=1.35:contrast=1.15"
     return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", *net_input_opts(src, reconnect=False), "-i", src,
-            "-map", "0:v:0", "-vf", video_filter(), "-r", str(FPS), "-sws_dither", "bayer", "-pix_fmt", "monob", "-f", "rawvideo", "pipe:1",
+            "-map", "0:v:0", "-vf", vf, "-r", str(FPS), *fmt, "pipe:1",
             "-map", "0:a:0?", "-ac", "1", "-ar", "44100", "-b:a", "48k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", f"pipe:{audio_fd}"]
 
 
-def pad_frame(raw):
-    """50-byte rows -> 52-byte rows (the LCD's row stride)."""
+def to_lcd_rows(raw):
+    """gray bytes (W*H) or monob bytes -> 52-byte LCD rows (1 = white, MSB first)."""
     out = bytearray(STRIDE * H)
+    if np is not None:
+        bits = np.frombuffer(raw, np.uint8).reshape(H, W).astype(np.float32) / 255.0 > _TH
+        rows = np.packbits(bits, axis=1)
+        buf = np.zeros((H, STRIDE), np.uint8)
+        buf[:, :SRC_ROW] = rows
+        return buf.tobytes()
     for y in range(H):
         out[y * STRIDE:y * STRIDE + SRC_ROW] = raw[y * SRC_ROW:(y + 1) * SRC_ROW]
     return bytes(out)
+
+
+_TH = _thresholds() if np is not None else None
 
 
 def video_packets(src):
@@ -185,7 +308,7 @@ def video_packets(src):
     threading.Thread(target=pump_audio, daemon=True).start()
     try:
         prev, n = bytes(STRIDE * H), 0
-        size = SRC_ROW * H
+        size = W * H if np is not None else SRC_ROW * H
         while True:
             raw = proc.stdout.read(size)
             if len(raw) < size:
@@ -195,15 +318,23 @@ def video_packets(src):
                 audio.clear()
             for c in chunks:
                 yield b"\x01" + len(c).to_bytes(2, "little") + c
-            cur = pad_frame(raw)
+            cur = to_lcd_rows(raw)
             key = n % KEY_EVERY == 0
-            base = bytes(STRIDE * H) if key else prev
-            delta = bytes(a ^ b for a, b in zip(cur, base))
+            if np is not None:
+                base = bytes(STRIDE * H) if key else prev
+                delta = (np.frombuffer(cur, np.uint8) ^ np.frombuffer(base, np.uint8)).tobytes()
+            else:
+                delta = bytes(a ^ b for a, b in zip(cur, bytes(STRIDE * H) if key else prev))
             body = (n * 1000 // FPS).to_bytes(4, "little") + bytes((1 if key else 0,)) + packbits(delta)
             yield b"\x02" + len(body).to_bytes(2, "little") + body
             prev, n = cur, n + 1
     finally:
         proc.kill()
+
+
+def ascii_msg(e):
+    """HTTP status lines are latin-1 only; yt-dlp errors often contain curly quotes."""
+    return str(e).replace("\n", " ")[:100].encode("ascii", "replace").decode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -253,6 +384,8 @@ class Handler(BaseHTTPRequestHandler):
             return self.send_error(403, "bad token")
         try:
             if u.path == "/t.mp3":
+                if not re.match(r"https?://", q["u"][0]):
+                    raise ValueError("http(s) URLs only")
                 return self.stream(q["u"][0])
             m = re.fullmatch(r"/bbc/([a-z0-9_]+)\.mp3", u.path)
             if m:
@@ -267,18 +400,37 @@ class Handler(BaseHTTPRequestHandler):
                 off, term = int(q.get("offset", ["0"])[0]), q.get("q", [""])[0].lower()
                 group = q.get("group", [None])[0]
                 rows = [(i, n) for i, (n, _, g) in enumerate(CHANNELS) if term in n.lower() and (group is None or g == group)]
-                page = [{"name": n, "path": f"/iptv/stream/{i}.mp3"} for i, n in rows[off:off + 39]]
+                page = [{"name": n, "path": f"/iptv/audio/{i}", "video": f"/iptv/video/{i}"} for i, n in rows[off:off + 39]]
                 if off + 39 < len(rows):
                     more = {k: v[0] for k, v in q.items() if k not in ("offset", "k")}
                     more["offset"] = off + 39
                     page.append({"name": f"More... ({len(rows) - off - 39} left)", "path": "/iptv/channels?" + urllib.parse.urlencode(more), "kind": "list"})
                 return self.send_json(page)
-            m = re.fullmatch(r"/iptv/stream/(\d+)\.mp3", u.path)
+            m = re.fullmatch(r"/(iptv|free|yt|ia)/(audio|video)/([\w.\-]+?)(?:\.mp3)?", u.path)
             if m:
-                return self.stream(CHANNELS[int(m[1])][1])
-            m = re.fullmatch(r"/iptv/video/(\d+)", u.path)
-            if m:
-                return self.stream_video(CHANNELS[int(m[1])][1])
+                kind, mode, ident = m.groups()
+                if kind == "iptv":
+                    src = CHANNELS[int(ident)][1]
+                elif kind == "free":
+                    src = FREE_LIVE[int(ident)][1]
+                elif kind == "yt":
+                    src = yt_media_url(ident)
+                else:
+                    src = ia_media_url(ident)
+                return self.stream(src) if mode == "audio" else self.stream_video(src)
+            if u.path == "/tv/shows":
+                return self.send_json([{"name": n, "path": "/yt/channel?c=" + urllib.parse.quote(url, safe=""), "kind": "list"} for n, url in SHOWS])
+            if u.path == "/tv/free":
+                return self.send_json(free_list("free", FREE_LIVE))
+            if u.path == "/yt/channel":
+                target = q["c"][0]
+                if not re.match(r"https://www\.youtube\.com/(@[\w.\-]+|channel/[\w\-]+)(/videos)?$", target):
+                    raise ValueError("YouTube channel URLs only")
+                return self.send_json(_cached(("ytlist", target), lambda: yt_list(target), 600))
+            if u.path == "/yt/search":
+                return self.send_json(_cached(("ytsearch", q["q"][0]), lambda: yt_list("ytsearch25:" + q["q"][0], 25), 600))
+            if u.path == "/ia/search":
+                return self.send_json(ia_list(q["q"][0], int(q.get("page", ["1"])[0])))
             if u.path == "/v":
                 if not re.match(r"https?://", q["u"][0]):
                     raise ValueError("http(s) URLs only")
@@ -291,21 +443,25 @@ class Handler(BaseHTTPRequestHandler):
                 return self.stream(tunein_stream(q["id"][0]))
             self.send_error(404)
         except (KeyError, IndexError, ValueError) as e:
-            self.send_error(400, str(e))
+            self.send_error(400, ascii_msg(e))
         except Exception as e:  # network errors etc.
-            self.send_error(502, str(e)[:100])
+            self.send_error(502, ascii_msg(e))
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8787)
-    ap.add_argument("--m3u", help="IPTV playlist URL or file")
+    ap.add_argument("--m3u", action="append", help="IPTV playlist URL or file (repeatable), e.g. https://iptv-org.github.io/iptv/categories/documentary.m3u")
+    ap.add_argument("--yt-cookies", help="cookies.txt for yt-dlp if YouTube asks you to sign in (bot check)")
     ap.add_argument("--token", help="require ?k=TOKEN on every request (use this when exposing the relay to the internet)")
     a = ap.parse_args()
-    TOKEN = a.token
+    TOKEN, YT_COOKIES = a.token, a.yt_cookies
+    for src in a.m3u or []:
+        CHANNELS.extend(load_m3u(src))
     if a.m3u:
-        CHANNELS[:] = load_m3u(a.m3u)
         print(f"loaded {len(CHANNELS)} channels")
+    if np is None:
+        print("numpy not found: video will use ffmpeg's plain Bayer dither (pip install numpy for the better one)")
     print(f"relay listening on {a.host}:{a.port}")
     ThreadingHTTPServer((a.host, a.port), Handler).serve_forever()

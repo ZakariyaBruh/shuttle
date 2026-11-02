@@ -11,7 +11,7 @@
 #define TINY_BODY 8192   /* a redirect page, as opposed to real content */
 
 static Req* reqs[MAX_REQS];
-static const char* UA = "User-Agent: PlaydateTuner/1.0\r\nAccept: */*\r\nConnection: close\r\n";
+static const char* UA = "User-Agent: Airwave/1.0\r\nAccept: */*\r\nConnection: close\r\n";
 
 static void* xrealloc(void* p, size_t n) { return pd->system->realloc(p, n); }
 
@@ -80,7 +80,11 @@ static bool connect_req(Req* r)
 	h->setHeadersReadCallback(r->conn, on_headers);
 	h->setRequestCompleteCallback(r->conn, on_complete);
 	h->setConnectionClosedCallback(r->conn, on_closed);
-	PDNetErr e = h->get(r->conn, path, UA, strlen(UA));
+	PDNetErr e;
+	if (r->postBody) {
+		static const char* ph = "User-Agent: Airwave/1.0\r\nAccept: */*\r\nConnection: close\r\nContent-Type: application/json\r\n";
+		e = h->post(r->conn, path, ph, strlen(ph), r->postBody, r->postLen);
+	} else e = h->get(r->conn, path, UA, strlen(UA));
 	if (e != NET_OK) { snprintf(r->error, sizeof r->error, "request failed (%d)", e); return false; }
 	return true;
 }
@@ -99,6 +103,21 @@ Req* net_get(const char* url, size_t maxBytes, ReqDone done, void* ud)
 	memset(r, 0, sizeof *r);
 	snprintf(r->url, sizeof r->url, "%s", url);
 	r->max = maxBytes; r->done = done; r->ud = ud;
+	r->cap = 4096; r->buf = xrealloc(NULL, r->cap);
+	if (!add_req(r)) return NULL;
+	if (!connect_req(r)) { r->status = -1; r->finished = true; }
+	return r;
+}
+
+Req* net_post(const char* url, const char* jsonBody, size_t maxBytes, ReqDone done, void* ud)
+{
+	Req* r = pd->system->realloc(NULL, sizeof(Req));
+	memset(r, 0, sizeof *r);
+	snprintf(r->url, sizeof r->url, "%s", url);
+	r->max = maxBytes; r->done = done; r->ud = ud;
+	r->postLen = strlen(jsonBody);
+	r->postBody = xrealloc(NULL, r->postLen + 1);
+	memcpy(r->postBody, jsonBody, r->postLen + 1);
 	r->cap = 4096; r->buf = xrealloc(NULL, r->cap);
 	if (!add_req(r)) return NULL;
 	if (!connect_req(r)) { r->status = -1; r->finished = true; }
@@ -124,6 +143,7 @@ void net_free(Req* r)
 	drop_conn(r);
 	if (r->buf) xrealloc(r->buf, 0);
 	ring_free(&r->ring);
+	if (r->postBody) xrealloc(r->postBody, 0);
 	xrealloc(r, 0);
 }
 

@@ -1,0 +1,2 @@
+numpy        # video dithering
+yt-dlp       # optional: YouTube (Nat Geo Wild etc.); also needs node or deno on PATH

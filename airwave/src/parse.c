@@ -54,14 +54,15 @@ const char* json_next_object(const char** cursor, const char* end, Span* obj)
 	return p;
 }
 
-static void unescape_into(const char* s, const char* e, char* out, size_t outsz)
+static void unescape_into(const char* s, const char* e, char* out, size_t outsz, bool keepNL)
 {
 	size_t o = 0;
 	while (s < e && o + 4 < outsz) {
 		if (*s == '\\' && s + 1 < e) {
 			s++;
 			switch (*s) {
-				case 'n': case 't': case 'r': out[o++] = ' '; s++; break;
+				case 'n': out[o++] = keepNL ? '\n' : ' '; s++; break;
+				case 't': case 'r': out[o++] = ' '; s++; break;
 				case 'u': {
 					unsigned v = 0;
 					if (s + 4 < e + 0 && sscanf(s + 1, "%4x", &v) == 1) {
@@ -110,7 +111,24 @@ bool json_get_str(Span obj, const char* key, char* out, size_t outsz)
 	const char *vs, *ve; bool isStr;
 	out[0] = 0;
 	if (!find_key(obj, key, &vs, &ve, &isStr) || !isStr) return false;
-	unescape_into(vs, ve, out, outsz);
+	unescape_into(vs, ve, out, outsz, false);
+	return true;
+}
+
+bool json_get_text(Span obj, const char* key, char* out, size_t outsz)
+{
+	const char *vs, *ve; bool isStr;
+	out[0] = 0;
+	if (!find_key(obj, key, &vs, &ve, &isStr) || !isStr) return false;
+	unescape_into(vs, ve, out, outsz, true);
+	return true;
+}
+
+bool json_get_obj(Span obj, const char* key, Span* out)
+{
+	const char *vs, *ve; bool isStr;
+	if (!find_key(obj, key, &vs, &ve, &isStr) || isStr || *vs != '{') return false;
+	out->s = vs; out->n = (size_t)(ve - vs);
 	return true;
 }
 
