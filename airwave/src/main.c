@@ -3,6 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <stdarg.h>
 #include "common.h"
 
 PlaydateAPI* pd;
@@ -24,13 +25,13 @@ PlaydateAPI* pd;
 typedef enum { K_NONE, K_MENU, K_RADIO_Q, K_SEARCH, K_SEARCH_ALL, K_SEARCH_IN, K_POD_CHARTS, K_POD_ID, K_POD_FEED, K_RELAY_LIST, K_PLAY, K_PLAY_VIDEO } Kind;
 typedef struct { char label[80]; char arg[1100]; Kind kind; } Item;
 typedef struct { char title[40]; Item* items; int n, sel, top; } List;
-typedef enum { M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT } Mode;
+typedef enum { M_SPLASH, M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT } Mode;
 typedef void (*Parser)(Req* r);
 
-static LCDFont *fBody, *fBold, *fBig;
+static LCDFont *fBody, *fBold, *fBig, *fTitle;
 static List* stack[8];
 static int depth;
-static Mode mode = M_LOADING;
+static Mode mode = M_SPLASH;
 static bool netAllowed, accessAsked;
 static char relayToken[48];       /* optional "relay_token", sent as ?k= (the relay's --token) */
 static char relayHost[128];       /* "host:port" or a full http(s):// URL (e.g. a Cloudflare tunnel) from Data/settings.json */
@@ -61,17 +62,32 @@ static char nowTitle[80];
 
 /* ---------- helpers ---------- */
 
+/* Opt-in breadcrumbs: set "debug": true in settings.json and the app appends what it is doing to Data/<bundle>/airwave.log, so a
+   hardware crash can be located (the last lines show the last thing that happened). */
+static bool debugOn;
+static void dbg(const char* fmt, ...)
+{
+	if (!debugOn) return;
+	static char line[200];
+	va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+	SDFile* f = pd->file->open("airwave.log", kFileAppend);
+	if (!f) return;
+	pd->file->write(f, line, (unsigned)strlen(line)); pd->file->write(f, "\n", 1);
+	pd->file->close(f);
+}
+
+
 static void* xalloc(size_t n) { return pd->system->realloc(NULL, n); }
-static void xfree(void* p) { pd->system->realloc(p, 0); }
+static void xfree(void* p) { if (p) pd->system->realloc(p, 0); }
 static uint32_t now_ms(void) { return pd->system->getCurrentTimeMilliseconds(); }
 
 static void T(LCDFont* f, const char* s, int x, int y, LCDBitmapDrawMode m)
 {
-	pd->graphics->setFont(f);
+	if (f) pd->graphics->setFont(f);
 	pd->graphics->setDrawMode(m);
 	pd->graphics->drawText(s, strlen(s), kUTF8Encoding, x, y);
 }
-static int TW(LCDFont* f, const char* s) { return pd->graphics->getTextWidth(f, s, strlen(s), kUTF8Encoding, 0); }
+static int TW(LCDFont* f, const char* s) { return f ? pd->graphics->getTextWidth(f, s, strlen(s), kUTF8Encoding, 0) : (int)strlen(s) * 7; }
 static void Tc(LCDFont* f, const char* s, int cx, int y, LCDBitmapDrawMode m) { T(f, s, cx - TW(f, s) / 2, y, m); }
 
 static void urlenc(const char* s, char* out, size_t sz)
@@ -93,18 +109,22 @@ static void show_msg(const char* fmt, const char* a)
 	mode = M_MSG;
 }
 
+static List deadList;                                   /* stand-in when memory runs out */
+
 static List* list_new(const char* title)
 {
 	List* l = xalloc(sizeof(List));
+	if (!l) { dbg("list_new: out of memory"); memset(&deadList, 0, sizeof deadList); return &deadList; }   /* empty, never NULL */
 	memset(l, 0, sizeof *l);
 	l->items = xalloc(sizeof(Item) * MAX_ITEMS);
+	if (!l->items) dbg("list_new: out of memory (items)");
 	snprintf(l->title, sizeof l->title, "%s", title);
 	return l;
 }
 
 static Item* list_add(List* l, const char* label, Kind k, const char* arg)
 {
-	if (l->n >= MAX_ITEMS) return NULL;
+	if (!l->items || l->n >= MAX_ITEMS) return NULL;
 	Item* it = &l->items[l->n++];
 	copy_ascii(it->label, sizeof it->label, label);
 	snprintf(it->arg, sizeof it->arg, "%s", arg ? arg : "");
@@ -112,7 +132,7 @@ static Item* list_add(List* l, const char* label, Kind k, const char* arg)
 	return it;
 }
 
-static void list_free(List* l) { xfree(l->items); xfree(l); }
+static void list_free(List* l) { if (l == &deadList) return; xfree(l->items); xfree(l); }
 
 static void push(List* l)
 {
@@ -159,7 +179,7 @@ static void load_settings(void)
 		}
 		return;
 	}
-	char buf[512];
+	static char buf[512];
 	int n = pd->file->read(f, buf, sizeof buf - 1);
 	pd->file->close(f);
 	if (n <= 0) return;
@@ -167,6 +187,8 @@ static void load_settings(void)
 	Span s = { buf, (size_t)n };
 	json_get_str(s, "relay", relayHost, sizeof relayHost);
 	json_get_str(s, "relay_token", relayToken, sizeof relayToken);
+	char dbgv[16]; json_get_str(s, "debug", dbgv, sizeof dbgv);
+	debugOn = strstr(buf, "\"debug\": true") || strstr(buf, "\"debug\":true");
 }
 
 /* ---------- menus ---------- */
@@ -245,6 +267,7 @@ static void on_fetched(Req* r) { (void)r; /* handled in update() */ }
 
 static void start_fetch(const char* url, size_t max, Parser p, const char* title)
 {
+	dbg("fetch %.100s", url);
 	if (pending) { net_free(pending); pending = NULL; }
 	snprintf(pendingTitle, sizeof pendingTitle, "%s", title);
 	pendingParser = p;
@@ -259,14 +282,13 @@ static void parse_radio(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		char name[96], url[400], codec[16], lab[96];
+		static char name[96], url[400], codec[16], lab[96], arg[1100];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "url_resolved", url, sizeof url);
 		json_get_str(o, "codec", codec, sizeof codec);
 		long br = json_get_int(o, "bitrate", 0);
 		if (!name[0] || !url[0]) continue;
 		bool mp3 = strcasecmp(codec, "MP3") == 0;
-		char arg[1100];
 		if (mp3) snprintf(arg, sizeof arg, "%s", url);
 		else if (relayHost[0]) via_relay(arg, sizeof arg, url);
 		else continue;
@@ -284,7 +306,7 @@ static void parse_charts(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		char name[96], id[24];
+		static char name[96], id[24];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "id", id, sizeof id);
 		if (name[0] && id[0]) list_add(l, name, K_POD_ID, id);
@@ -299,7 +321,7 @@ static void parse_search(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		char name[96], feed[520];
+		static char name[96], feed[520];
 		json_get_str(o, "collectionName", name, sizeof name);
 		json_get_str(o, "feedUrl", feed, sizeof feed);
 		if (name[0] && feed[0]) list_add(l, name, K_POD_FEED, feed);
@@ -314,7 +336,7 @@ static void parse_episodes(Req* r)
 	const char* cur = r->buf; Span item;
 	int skipped = 0;
 	while (l->n < MAX_ITEMS && rss_next_item(&cur, &item)) {
-		static char url[1000]; char title[96], arg[1100]; bool mp3;
+		static char url[1000], title[96], arg[1100]; bool mp3;
 		if (!rss_enclosure(item, url, sizeof url, &mp3)) continue;
 		if (!mp3 && !relayHost[0]) { skipped++; continue; }
 		if (!rss_tag_text(item, "title", title, sizeof title)) snprintf(title, sizeof title, "Episode");
@@ -332,7 +354,7 @@ static void parse_episodes(Req* r)
 static void parse_lookup(Req* r)
 {
 	const char* arr = json_array_start(r->buf, "results");
-	const char* cur = arr; Span o; char feed[560] = "";
+	const char* cur = arr; Span o; static char feed[560]; feed[0] = 0;
 	if (arr && json_next_object(&cur, r->buf + r->len, &o)) json_get_str(o, "feedUrl", feed, sizeof feed);
 	if (!feed[0]) { show_msg("No feed URL for this podcast.", NULL); return; }
 	char title[40]; snprintf(title, sizeof title, "%s", pendingTitle);
@@ -346,7 +368,7 @@ static void parse_relay_list(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		char name[120], path[480], video[200], kind[16], a[500];
+		static char name[120], path[480], video[200], kind[16], a[500];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "path", path, sizeof path);
 		json_get_str(o, "video", video, sizeof video);
@@ -412,6 +434,7 @@ static void start_playback(const char* title, const char* arg, bool video)
 		relay_url(url, sizeof url, arg + 6);
 	} else snprintf(url, sizeof url, "%s", arg);
 	copy_ascii(nowTitle, sizeof nowTitle, title);
+	dbg("play %s %.100s", video ? "video" : "audio", url);
 	stream = net_stream(url, video ? VIDEO_RING : RING_BYTES);
 	if (!stream) { show_msg("Out of memory", NULL); return; }
 	Ring* src = &stream->ring;
@@ -421,6 +444,7 @@ static void start_playback(const char* title, const char* arg, bool video)
 		src = &audioRing;
 	}
 	player = pd->sound->fileplayer->newPlayer();
+	if (!player) { stop_playback(); show_msg("Couldn't start the audio player.", NULL); return; }
 	pd->sound->fileplayer->setStopOnUnderrun(player, 0);
 	pd->sound->fileplayer->setMP3StreamSource(player, data_source, src, 2.0f);
 	mode = video ? M_VIDEO : M_PLAY;
@@ -512,7 +536,9 @@ static void video_show(uint32_t now)
 	if (vGotFrame && !overlayArmed) { overlayArmed = true; overlayUntil = now + 3500; }
 	bool overlay = vGotFrame && now < overlayUntil;
 	if (changed || overlay || overlayDrawn) {
-		memcpy(pd->graphics->getFrame(), frameBuf, FRAME_BYTES);
+		uint8_t* fb = pd->graphics->getFrame();
+		if (!fb) return;
+		memcpy(fb, frameBuf, FRAME_BYTES);
 		if (overlay) {                                           /* channel name for a few seconds after tuning in */
 			pd->graphics->fillRect(0, 0, 400, 22, kColorBlack);
 			T(fBold, nowTitle, 6, 3, kDrawModeFillWhite);
@@ -560,7 +586,7 @@ static void chat_add_line(const char* s, size_t n, uint8_t style)
 static void chat_wrap(const char* text, uint8_t style, const char* prefix)
 {
 	const int maxw = chatWrapW;
-	char line[80]; line[0] = 0;
+	static char line[80]; line[0] = 0;
 	size_t pl = strlen(prefix);
 	bool first = true;
 	snprintf(line, sizeof line, "%s", prefix);
@@ -568,9 +594,9 @@ static void chat_wrap(const char* text, uint8_t style, const char* prefix)
 	while (*p) {
 		if (*p == '\n') { chat_add_line(line, strlen(line), style); snprintf(line, sizeof line, "%s", first ? "" : ""); line[0] = 0; first = false; p++; continue; }
 		const char* e = p; while (*e && *e != ' ' && *e != '\n') e++;
-		char word[80]; size_t wl = (size_t)(e - p); if (wl > 60) wl = 60;
+		static char word[80]; size_t wl = (size_t)(e - p); if (wl > 60) wl = 60;
 		snprintf(word, sizeof word, "%.*s", (int)wl, p);
-		char trial[160]; snprintf(trial, sizeof trial, "%s%s%s", line, (line[0] && strcmp(line, prefix)) ? " " : "", word);
+		static char trial[160]; snprintf(trial, sizeof trial, "%s%s%s", line, (line[0] && strcmp(line, prefix)) ? " " : "", word);
 		if (TW(fBody, trial) > maxw && line[0] && strcmp(line, prefix)) { chat_add_line(line, strlen(line), style); snprintf(line, sizeof line, "%s", word); first = false; }
 		else snprintf(line, sizeof line, "%.78s", trial);
 		p = e; while (*p == ' ') p++;
@@ -609,11 +635,11 @@ static void parse_chat_reply(Req* r)
 	const char* arr = json_array_start(r->buf, "choices");
 	const char* cur = arr; Span o, m;
 	if (arr && json_next_object(&cur, r->buf + r->len, &o) && json_get_obj(o, "message", &m)) json_get_text(m, "content", reply, sizeof reply);
-	char clean[900]; size_t k = 0;
+	static char clean[900]; size_t k = 0;
 	for (size_t i = 0; reply[i] && k + 1 < sizeof clean; i++) if (reply[i] != '*' && reply[i] != '#' && reply[i] != '`') clean[k++] = reply[i];
 	clean[k] = 0;
 	/* drop emoji and symbols the Latin-only font can't draw (copy_ascii would turn each into '?') */
-	char kept[900]; size_t q = 0;
+	static char kept[900]; size_t q = 0;
 	for (size_t i = 0; clean[i] && q + 4 < sizeof kept;) {
 		unsigned char c = (unsigned char)clean[i];
 		if (c >= 0xF0) i += 4;
@@ -621,7 +647,7 @@ static void parse_chat_reply(Req* r)
 		else kept[q++] = clean[i++];
 	}
 	kept[q] = 0;
-	char shown[900]; copy_ascii(shown, sizeof shown, kept);
+	static char shown[900]; copy_ascii(shown, sizeof shown, kept);
 	chat_add(false, shown[0] ? shown : "(no answer - try again)");
 }
 
@@ -650,7 +676,7 @@ static void chat_poll(void)
 	Req* r = chatReq; chatReq = NULL;
 	if (r->status == 429) chat_add(false, "(Pollinations is busy - wait a few seconds and try again)");
 	else if (r->status < 0 || r->status >= 400 || r->len == 0) {
-		char m[120]; snprintf(m, sizeof m, "(couldn't reach the AI: %s)", r->error[0] ? r->error : "no answer");
+		static char m[120]; snprintf(m, sizeof m, "(couldn't reach the AI: %s)", r->error[0] ? r->error : "no answer");
 		chat_add(false, m);
 	} else parse_chat_reply(r);
 	net_free(r);
@@ -680,8 +706,7 @@ static void open_text(const char* source, int max)
 /* source: "radio" | "pod" | "tunein" | "iptv" | "yt" | "ia" */
 static void run_search(const char* source, const char* query)
 {
-	static char url[900];
-	char enc[200], path[300];
+	static char url[900], enc[200], path[300];
 	urlenc(query, enc, sizeof enc);
 	if (!strcmp(source, "radio")) {
 		snprintf(url, sizeof url, "%s%s&name=%s", RB_BASE, relayHost[0] ? "" : "&codec=MP3", enc);
@@ -966,11 +991,11 @@ static const char* search_title(void)
 /* what you are typing, wrapped to `w` pixels; returns the number of lines drawn */
 static int draw_typed(int x, int y, int w, int maxLines)
 {
-	char shown[160]; snprintf(shown, sizeof shown, "%.*s", textLen, textBuf);
+	static char shown[160]; snprintf(shown, sizeof shown, "%.*s", textLen, textBuf);
 	int n = (int)strlen(shown), pos = 0, line = 0, endx = x;
 	while ((pos < n || line == 0) && line < maxLines) {
 		int cut = n - pos;
-		char seg[100];
+		static char seg[100];
 		while (cut > 0 && TW(fBody, (snprintf(seg, sizeof seg, "%.*s", cut > 90 ? 90 : cut, shown + pos), seg)) > w) cut--;
 		if (cut == 0 && pos < n) cut = 1;
 		if (pos + cut < n && cut > 4) { int k = cut; while (k > 1 && shown[pos + k] != ' ') k--; if (k > 3) cut = k; }
@@ -1031,6 +1056,82 @@ static void draw_chat(void)
 	footer(typing ? "OK sends, B deletes" : "A write    crank / up-down scroll    B back");
 }
 
+/* ---------- splash animation and page transitions ---------- */
+
+#ifndef TRANS_MS
+#define TRANS_MS 230
+#endif
+static LCDBitmap* oldBmp;              /* the screen we are leaving, slid out while the new one slides in */
+static struct { bool active; int dir; uint32_t t0; } trans;
+static uint32_t splashT0, fadeInT0;
+
+/* ordered-dither fade: cover the screen with `black`/white at coverage `level` 0..16 (a 4x4 Bayer mask, so it dissolves) */
+static void fade_overlay(int x, int y, int w, int h, bool black, int level)
+{
+	static const uint8_t bayer[4][4] = { {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5} };
+	if (level <= 0) return;
+	static uint8_t pat[16];                       /* 8 rows of colour then 8 rows of mask */
+	for (int r = 0; r < 8; r++) {
+		uint8_t mask = 0;
+		for (int c = 0; c < 8; c++) if (bayer[r & 3][c & 3] < level) mask |= (uint8_t)(0x80 >> c);
+		pat[r] = black ? 0x00 : 0xFF; pat[8 + r] = mask;
+	}
+	pd->graphics->fillRect(x, y, w, h, (LCDColor)(uintptr_t)pat);
+}
+
+static float ease_out(float t) { t = t < 0 ? 0 : t > 1 ? 1 : t; return 1 - (1 - t) * (1 - t) * (1 - t); }
+
+static int ui_level(void)
+{
+	switch (mode) {
+		case M_SPLASH: return -1;
+		case M_HOME: return 0;
+		case M_LIST: case M_LOADING: return depth;
+		default: return depth + 1;
+	}
+}
+
+static bool trans_ok(Mode m) { return m != M_VIDEO && m != M_SPLASH && m != M_TEXT; }
+
+static void trans_start(int dir)
+{
+	if (!oldBmp) return;
+	uint8_t *data, *mask; int w, h, rb;
+	uint8_t* fb = pd->graphics->getFrame();
+	pd->graphics->getBitmapData(oldBmp, &w, &h, &rb, &mask, &data);
+	if (!fb || !data || h < 240 || rb < 50) return;
+	for (int y = 0; y < 240; y++) memcpy(data + y * rb, fb + y * LCD_ROWSIZE, rb < LCD_ROWSIZE ? (size_t)rb : (size_t)LCD_ROWSIZE);
+	trans.active = true; trans.dir = dir; trans.t0 = now_ms();
+}
+
+static void draw_splash(uint32_t t)
+{
+	pd->graphics->clear(kColorBlack);
+	const LCDColor W = kColorWhite;
+	const int cx = 52, cy = 120;
+	float dotT = ease_out(t / 450.0f);
+	int dr = (int)(13 * dotT);
+	if (dr > 0) pd->graphics->fillEllipse(cx - dr, cy - dr, dr * 2, dr * 2, 0, 0, W);
+	for (int i = 0; i < 6; i++) {                         /* radio waves leave the dot one after another */
+		float p = ease_out(((int)t - 300 - i * 150) / 650.0f);
+		if (p <= 0) continue;
+		int r = (int)(16 + p * (22 + i * 17));
+		int lw = 6 - i / 2;
+		pd->graphics->drawEllipse(cx - r, cy - r, r * 2, r * 2, lw < 2 ? 2 : lw, 30, 150, W);
+	}
+	/* wordmark and tagline dissolve in (the black overlay thins out) */
+	const int tx = 176, ty = 78;
+	T(fTitle ? fTitle : fBig, "Airwave", tx, ty, kDrawModeFillWhite);
+	T(fBody, "radio  podcasts  TV  chat", tx + 2, ty + 54, kDrawModeFillWhite);
+	pd->graphics->fillRect(tx + 2, ty + 42, 190, 2, W);
+	int tl = 16 - (int)(16 * (t - 900) / 700.0f), gl = 16 - (int)(16 * (t - 1500) / 600.0f);
+	if (t < 900) tl = 16;
+	if (t < 1500) gl = 16;
+	fade_overlay(tx - 4, ty - 6, 230, 50, true, tl);
+	fade_overlay(tx - 4, ty + 40, 230, 36, true, gl);
+	if (t > 2500) fade_overlay(0, 0, 400, 240, false, (int)(16 * (t - 2500) / 380.0f));   /* dissolve to white, then the home screen fades in */
+}
+
 /* ---------- main loop ---------- */
 
 static void on_access(bool allowed, void* ud) { (void)ud; netAllowed = allowed; if (!allowed) show_msg("Network access was denied.", NULL); }
@@ -1058,13 +1159,32 @@ static void list_input(List* l, PDButtons pushed)
    re-lays itself out in the free width, so it follows the keyboard. */
 static void app_update(int left, bool keyboardOn)
 {
+	static bool first = true;
+	if (first) { first = false; dbg("first frame"); }
 	PDButtons cur, pushed, released;
 	pd->system->getButtonState(&cur, &pushed, &released);
 	kbVisible = keyboardOn;
 	viewW = left < 160 ? 160 : left > 400 ? 400 : left;
 	if (keyboardOn) pushed = 0;                                   /* the keyboard owns the buttons (they still reach us as raw state) */
+	if (mode == M_SPLASH) {
+		uint32_t now = now_ms();
+		if (!splashT0) splashT0 = now;
+		uint32_t t = now - splashT0;
+		if ((pushed & (kButtonA | kButtonB)) && t > 700 && t < 2500) { splashT0 = now - 2500; t = 2500; }     /* skip */
+		draw_splash(t);
+		if (t >= 2880) { mode = netAllowed ? M_HOME : M_LOADING; fadeInT0 = now; }
+		return;
+	}
+	if (trans.active) pushed = 0;                                 /* no input while sliding */
 	if (mode != M_VIDEO) pd->graphics->clear(kColorWhite);
 	if (viewW < 400) pd->graphics->setClipRect(0, 0, viewW, 240); else pd->graphics->clearClipRect();
+	Mode drawnMode = mode; int drawnLevel = ui_level();
+	int slideX = 0;
+	if (trans.active) {                                            /* the new screen is drawn shifted; the old bitmap fills the gap */
+		float t = (float)(now_ms() - trans.t0) / TRANS_MS;
+		if (t >= 1.0f) trans.active = false;
+		else { int m = (int)(400 * (1.0f - ease_out(t))); slideX = trans.dir > 0 ? m : -m; pd->graphics->setDrawOffset(slideX, 0); }
+	}
 
 	if (!accessAsked) {
 		accessAsked = true;
@@ -1082,7 +1202,7 @@ static void app_update(int left, bool keyboardOn)
 	if (pending && pending->finished) {
 		Req* r = pending; pending = NULL;
 		Parser p = pendingParser;
-		if (r->status < 0 || r->status >= 400) { char m[200]; snprintf(m, sizeof m, "%s%s", r->error[0] ? r->error : "request failed", r->status == 502 ? " - the relay couldn't open that source" : ""); show_msg("Couldn't load: %s", m); }
+		if (r->status < 0 || r->status >= 400) { static char m[200]; snprintf(m, sizeof m, "%s%s", r->error[0] ? r->error : "request failed", r->status == 502 ? " - the relay couldn't open that source" : ""); show_msg("Couldn't load: %s", m); }
 		else if (r->len == 0) show_msg("The server sent nothing.", NULL);
 		else p(r);
 		net_free(r);
@@ -1128,7 +1248,7 @@ static void app_update(int left, bool keyboardOn)
 			header("Airwave", "");
 			int y = 36; const char* s = msg;
 			while (*s) {                                                                    /* wrap by width, honour \n */
-				char line[100]; int n = 0;
+				static char line[100]; int n = 0;
 				while (s[n] && s[n] != '\n' && n < 90 && TW(fBody, (snprintf(line, sizeof line, "%.*s", n + 1, s), line)) < 380) n++;
 				if (s[n] && s[n] != '\n') { int k = n; while (k > 1 && s[k] != ' ') k--; if (k > 4) n = k; }
 				snprintf(line, sizeof line, "%.*s", n, s);
@@ -1191,6 +1311,25 @@ static void app_update(int left, bool keyboardOn)
 		}
 	}
 	if (viewW < 400) pd->graphics->clearClipRect();
+	if (slideX) {                                                  /* finish the slide: put the old page back beside the new one */
+		pd->graphics->setDrawOffset(0, 0);
+		pd->graphics->clearClipRect();
+		int ox = trans.dir > 0 ? slideX - 400 : 400 + slideX;
+		pd->graphics->setDrawMode(kDrawModeCopy);                  /* text drawing leaves a fill mode set; a bitmap needs plain copy */
+		pd->graphics->drawBitmap(oldBmp, ox, 0, kBitmapUnflipped);
+		int ex = trans.dir > 0 ? slideX : 400 + slideX;
+		pd->graphics->drawLine(ex, 0, ex, 240, 2, kColorBlack);
+	}
+	/* a level change (list opened/closed, player opened...) starts a slide: the frame just drawn is the page being left */
+	int lvlNow = ui_level();
+	if (lvlNow != drawnLevel && !trans.active && !kbVisible && trans_ok(drawnMode) && trans_ok(mode)) {
+		pd->graphics->setDrawOffset(0, 0);
+		trans_start(lvlNow > drawnLevel ? 1 : -1);
+	}
+	if (fadeInT0) {                                                /* home fades in from white after the splash */
+		int lv = 16 - (int)(16 * (now_ms() - fadeInT0) / 380.0f);
+		if (lv <= 0) fadeInT0 = 0; else fade_overlay(0, 0, 400, 240, false, lv);
+	}
 }
 
 /* ---------- Lua bridge: main.lua drives the loop and the system keyboard ---------- */
@@ -1227,9 +1366,12 @@ static int l_kbDone(lua_State* L)                        /* keyboard closing: ok
 	(void)L;
 	bool ok = pd->lua->getArgBool(1);
 	kbActive = false; kbWant = false;
+	dbg("keyboard closed ok=%d len=%d", ok, textLen);
 	if (ok) submit_text(); else if (mode == M_TEXT) mode = depth ? M_LIST : M_HOME;
 	return 0;
 }
+
+static void wifi_done(PDNetErr err) { dbg("wifi: %d", (int)err); }
 
 #ifdef _WINDLL
 __declspec(dllexport)
@@ -1243,11 +1385,15 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		fBody = pd->graphics->loadFont("/System/Fonts/Roobert-11-Medium.pft", &err);
 		fBold = pd->graphics->loadFont("/System/Fonts/Roobert-11-Bold.pft", &err);
 		fBig = pd->graphics->loadFont("/System/Fonts/Roobert-20-Medium.pft", &err);
+		fTitle = pd->graphics->loadFont("/System/Fonts/Roobert-24-Medium.pft", &err);
+		oldBmp = pd->graphics->newBitmap(400, 240, kColorWhite);
 		if (!fBody) fBody = pd->graphics->loadFont("/System/Fonts/Asheville-Sans-14-Light.pft", &err);
 		if (!fBold) fBold = fBody;
 		if (!fBig) fBig = fBold;
 		load_settings();
-		pd->network->setEnabled(true, NULL);
+		if (debugOn) { SDFile* lf = pd->file->open("airwave.log", kFileWrite); if (lf) pd->file->close(lf); }
+		dbg("init: fonts %p %p %p", (void*)fBody, (void*)fBold, (void*)fBig);
+		pd->network->setEnabled(true, wifi_done);       /* the device may call this unconditionally, so never pass NULL */
 		/* no update callback on purpose: that makes the system start Lua, and main.lua drives the frames */
 	} else if (event == kEventInitLua) {
 		const char* err;

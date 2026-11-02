@@ -62,7 +62,7 @@ static void drop_conn(Req* r)
 static bool connect_req(Req* r)
 {
 	static char path[URL_MAX];
-	char host[200]; int port; bool ssl;
+	static char host[200]; int port; bool ssl;
 	r->headers = r->complete = r->closed = false;
 	r->status = 0; r->loc[0] = 0;
 	r->lastProgress = pd->system->getCurrentTimeMilliseconds();
@@ -237,7 +237,7 @@ static void pump(Req* r)
 	size_t avail = h->getBytesAvailable(r->conn);
 	int guard = 0;
 	while (avail > 0 && guard++ < 32) {
-		uint8_t tmp[2048];
+		static uint8_t tmp[2048];     /* static: the device's C stack is small */
 		size_t want = avail < sizeof tmp ? avail : sizeof tmp;
 		if (r->stream) {
 			uint32_t free_ = ring_space(&r->ring);

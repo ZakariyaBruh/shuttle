@@ -200,7 +200,7 @@ bool rss_enclosure(Span item, char* url, size_t sz, bool* isMp3)
 	memcpy(url, u, n); url[n] = 0;
 	xml_unescape(url);
 	const char* t = find_ci(s, tagEnd, "audio/mpeg");
-	char path[640]; snprintf(path, sizeof path, "%s", url);
+	static char path[640]; snprintf(path, sizeof path, "%s", url);
 	char* qm = strchr(path, '?'); if (qm) *qm = 0;
 	size_t pl = strlen(path);
 	*isMp3 = t != NULL || (pl > 4 && strcasecmp(path + pl - 4, ".mp3") == 0);
