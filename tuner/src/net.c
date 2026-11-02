@@ -110,8 +110,8 @@ Req* net_stream(const char* url, size_t ringBytes)
 	Req* r = pd->system->realloc(NULL, sizeof(Req));
 	memset(r, 0, sizeof *r);
 	snprintf(r->url, sizeof r->url, "%s", url);
-	r->stream = true; r->rsize = (uint32_t)ringBytes;
-	r->ring = xrealloc(NULL, ringBytes);
+	r->stream = true;
+	if (!ring_init(&r->ring, (uint32_t)ringBytes)) { xrealloc(r, 0); return NULL; }
 	if (!add_req(r)) return NULL;
 	if (!connect_req(r)) { r->status = -1; r->finished = true; }
 	return r;
@@ -123,24 +123,53 @@ void net_free(Req* r)
 	for (int i = 0; i < MAX_REQS; i++) if (reqs[i] == r) reqs[i] = NULL;
 	drop_conn(r);
 	if (r->buf) xrealloc(r->buf, 0);
-	if (r->ring) xrealloc(r->ring, 0);
+	ring_free(&r->ring);
 	xrealloc(r, 0);
 }
 
-uint32_t ring_fill(Req* r)
+bool ring_init(Ring* g, uint32_t size)
 {
-	return __atomic_load_n(&r->head, __ATOMIC_ACQUIRE) - __atomic_load_n(&r->tail, __ATOMIC_ACQUIRE);
+	memset(g, 0, sizeof *g);
+	g->buf = xrealloc(NULL, size);
+	g->size = g->buf ? size : 0;
+	return g->buf != NULL;
 }
 
-/* consumer side: runs on the audio thread */
-int ring_read(Req* r, uint8_t* out, int n)
+void ring_free(Ring* g) { if (g->buf) xrealloc(g->buf, 0); memset(g, 0, sizeof *g); }
+
+uint32_t ring_fill(Ring* g)
 {
-	uint32_t head = __atomic_load_n(&r->head, __ATOMIC_ACQUIRE);
-	uint32_t tail = r->tail;
+	return __atomic_load_n(&g->head, __ATOMIC_ACQUIRE) - __atomic_load_n(&g->tail, __ATOMIC_ACQUIRE);
+}
+
+uint32_t ring_space(Ring* g) { return g->size - ring_fill(g); }
+
+void ring_put(Ring* g, const uint8_t* data, uint32_t n)
+{
+	uint32_t head = g->head;
+	for (uint32_t i = 0; i < n; i++) g->buf[(head + i) % g->size] = data[i];
+	__atomic_store_n(&g->head, head + n, __ATOMIC_RELEASE);
+}
+
+uint32_t ring_peek(Ring* g, uint32_t offset, uint8_t* out, uint32_t n)
+{
+	uint32_t avail = ring_fill(g);
+	if (offset >= avail) return 0;
+	if (n > avail - offset) n = avail - offset;
+	uint32_t tail = g->tail + offset;
+	for (uint32_t i = 0; i < n; i++) out[i] = g->buf[(tail + i) % g->size];
+	return n;
+}
+
+/* consumer side: may run on the audio thread */
+int ring_read(Ring* g, uint8_t* out, int n)
+{
+	uint32_t head = __atomic_load_n(&g->head, __ATOMIC_ACQUIRE);
+	uint32_t tail = g->tail;
 	uint32_t avail = head - tail;
 	if ((uint32_t)n > avail) n = (int)avail;
-	if (out) for (int i = 0; i < n; i++) out[i] = r->ring[(tail + i) % r->rsize];   /* out == NULL: the decoder is skipping bytes */
-	__atomic_store_n(&r->tail, tail + n, __ATOMIC_RELEASE);
+	if (out) for (int i = 0; i < n; i++) out[i] = g->buf[(tail + i) % g->size];   /* out == NULL: the decoder is skipping bytes */
+	__atomic_store_n(&g->tail, tail + n, __ATOMIC_RELEASE);
 	return n;
 }
 
@@ -178,7 +207,7 @@ static void follow_redirect(Req* r)
 	snprintf(r->url, sizeof r->url, "%s", next);
 	drop_conn(r);
 	r->len = 0; r->total = 0;
-	if (r->ring) r->tail = r->head;
+	if (r->ring.buf) r->ring.tail = r->ring.head;
 	if (!connect_req(r)) fail(r, r->error[0] ? r->error : "redirect failed");
 }
 
@@ -191,7 +220,7 @@ static void pump(Req* r)
 		uint8_t tmp[2048];
 		size_t want = avail < sizeof tmp ? avail : sizeof tmp;
 		if (r->stream) {
-			uint32_t free_ = r->rsize - ring_fill(r);
+			uint32_t free_ = ring_space(&r->ring);
 			if (free_ == 0) break;                 /* back-pressure: leave data in the connection */
 			if (want > free_) want = free_;
 		} else if (r->len + want > r->max) {
@@ -202,9 +231,7 @@ static void pump(Req* r)
 		if (n <= 0) break;
 		r->lastProgress = pd->system->getCurrentTimeMilliseconds();
 		if (r->stream) {
-			uint32_t head = r->head;
-			for (int i = 0; i < n; i++) r->ring[(head + i) % r->rsize] = tmp[i];
-			__atomic_store_n(&r->head, head + n, __ATOMIC_RELEASE);
+			ring_put(&r->ring, tmp, (uint32_t)n);
 			r->total += n;
 		} else {
 			if (r->len + n + 1 > r->cap) {
@@ -240,7 +267,7 @@ void net_update(void)
 
 		if (r->finished) { }
 		else if (r->stream) {
-			if (r->closed && h->getBytesAvailable(r->conn) == 0 && ring_fill(r) == 0) fail(r, "stream ended");
+			if (r->closed && h->getBytesAvailable(r->conn) == 0 && ring_fill(&r->ring) == 0) fail(r, "stream ended");
 		} else {
 			/* Servers using chunked encoding / keep-alive may never fire the "complete" callback, so also
 			   finish when Content-Length has been read, or after the body has been idle for a moment. */
@@ -255,7 +282,7 @@ void net_update(void)
 				if (r->status == 0) r->status = 200;
 			}
 		}
-		if (!r->finished && now - r->lastProgress > STALL_MS && !(r->stream && ring_fill(r) > 0))
+		if (!r->finished && now - r->lastProgress > STALL_MS && !(r->stream && ring_fill(&r->ring) > 0))
 			fail(r, "timed out");
 		if (r->finished && r->done) { ReqDone d = r->done; r->done = NULL; d(r); }
 	}

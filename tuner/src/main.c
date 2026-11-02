@@ -1,4 +1,4 @@
-/* Tuner - internet radio, Apple Podcasts, BBC radio and IPTV audio for Playdate. */
+/* Tuner - internet radio, Apple Podcasts, BBC radio, TuneIn and IPTV (dithered video) for Playdate. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -12,12 +12,19 @@ PlaydateAPI* pd;
 #define RING_BYTES (160 * 1024)
 #define PREBUFFER (48 * 1024)
 #define MAX_ITEMS 40
+#define VIDEO_RING (192 * 1024)
+#define VIDEO_AUDIO_RING (48 * 1024)
+#define VIDEO_AUDIO_START (9 * 1024)   /* ~1.5 s of the relay's 48 kbps audio */
+#define AV_DELAY_MS 1500               /* video is shown this long after it arrives, to line up with the audio prebuffer */
+#define VQ_MAX 64
+#define FRAME_BYTES (LCD_ROWSIZE * 240)
 #define ENC_MAX (URL_MAX * 3)
 
-typedef enum { K_NONE, K_MENU, K_RADIO_Q, K_RADIO_SEARCH, K_POD_CHARTS, K_POD_SEARCH, K_POD_ID, K_POD_FEED, K_RELAY_LIST, K_RELAY_SEARCH, K_PLAY } Kind;
+typedef enum { K_NONE, K_MENU, K_RADIO_Q, K_RADIO_SEARCH, K_POD_CHARTS, K_POD_SEARCH, K_POD_ID, K_POD_FEED, K_RELAY_LIST, K_RELAY_SEARCH,
+	K_IPTV_SEARCH, K_SEARCH_ALL, K_SEARCH_IN, K_PLAY, K_PLAY_VIDEO } Kind;
 typedef struct { char label[80]; char arg[1100]; Kind kind; } Item;
 typedef struct { char title[40]; Item* items; int n, sel, top; } List;
-typedef enum { M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY } Mode;
+typedef enum { M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO } Mode;
 typedef void (*Parser)(Req* r);
 
 static LCDFont* font;
@@ -25,7 +32,8 @@ static List* stack[8];
 static int depth;
 static Mode mode = M_LOADING;
 static bool netAllowed, accessAsked;
-static char relayHost[96];        /* "host:port" from Data/settings.json, empty if unset */
+static char relayToken[48];       /* optional "relay_token", sent as ?k= (the relay's --token) */
+static char relayHost[128];       /* "host:port" or a full http(s):// URL (e.g. a Cloudflare tunnel) from Data/settings.json */
 static char msg[200];
 
 /* loading */
@@ -34,6 +42,7 @@ static Parser pendingParser;
 static char pendingTitle[40];
 
 /* text entry */
+static char searchQuery[28];
 static char textBuf[28];
 static int textLen;
 static int charIdx;
@@ -108,7 +117,12 @@ static void pop(void)
 
 static const char* relay_url(char* out, size_t sz, const char* path)
 {
-	snprintf(out, sz, "http://%s%s", relayHost, path);
+	if (!strncmp(relayHost, "http", 4)) snprintf(out, sz, "%s%s", relayHost, path);   /* full URL, e.g. https://x.trycloudflare.com */
+	else snprintf(out, sz, "http://%s%s", relayHost, path);
+	if (relayToken[0]) {
+		size_t n = strlen(out);
+		snprintf(out + n, sz - n, "%ck=%s", strchr(path, '?') ? '&' : '?', relayToken);
+	}
 	return out;
 }
 
@@ -128,7 +142,7 @@ static void load_settings(void)
 	if (!f) {
 		f = pd->file->open("settings.json", kFileWrite);
 		if (f) {
-			const char* t = "{\n  \"relay\": \"\"\n}\n";
+			const char* t = "{\n  \"relay\": \"\",\n  \"relay_token\": \"\"\n}\n";
 			pd->file->write(f, t, (unsigned)strlen(t));
 			pd->file->close(f);
 		}
@@ -141,6 +155,7 @@ static void load_settings(void)
 	buf[n] = 0;
 	Span s = { buf, (size_t)n };
 	json_get_str(s, "relay", relayHost, sizeof relayHost);
+	json_get_str(s, "relay_token", relayToken, sizeof relayToken);
 }
 
 /* ---------- menus ---------- */
@@ -148,10 +163,11 @@ static void load_settings(void)
 static void build_root(void)
 {
 	List* l = list_new("Tuner");
+	list_add(l, "Search...", K_SEARCH_ALL, "");
 	list_add(l, "Radio", K_MENU, "radio");
 	list_add(l, "Podcasts (Apple)", K_MENU, "pod");
 	list_add(l, "BBC Radio", K_MENU, "bbc");
-	list_add(l, "IPTV channels (audio)", K_RELAY_LIST, "/iptv/channels");
+	list_add(l, "IPTV (video)", K_MENU, "iptv");
 	list_add(l, "TuneIn radio", K_MENU, "tunein");
 	push(l);
 }
@@ -184,6 +200,11 @@ static void open_menu(const char* id)
 			snprintf(lab, sizeof lab, "BBC %s", st[i][0]);
 			list_add(l, lab, K_PLAY, a);
 		}
+	} else if (!strcmp(id, "iptv")) {
+		l = list_new("IPTV");
+		list_add(l, "Search channels...", K_IPTV_SEARCH, "");
+		list_add(l, "Groups", K_RELAY_LIST, "/iptv/groups");
+		list_add(l, "All channels", K_RELAY_LIST, "/iptv/channels");
 	} else {
 		l = list_new("TuneIn");
 		list_add(l, "Trending", K_RELAY_LIST, "/tunein/browse");
@@ -292,18 +313,21 @@ static void parse_lookup(Req* r)
 	start_fetch(feed, 320 * 1024, parse_episodes, title);
 }
 
-static void parse_relay_list(Req* r)   /* [{"name": "...", "path": "/t.mp3?..."}] */
+static void parse_relay_list(Req* r)   /* [{"name": "...", "path": "/t.mp3?...", "kind": "list"?}] */
 {
 	const char* arr = json_array_start(r->buf, NULL);
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		char name[96], path[480], a[500];
+		char name[96], path[480], kind[16], a[500];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "path", path, sizeof path);
+		json_get_str(o, "kind", kind, sizeof kind);
 		if (!name[0] || !path[0]) continue;
+		if (!strcmp(kind, "list")) { list_add(l, name, K_RELAY_LIST, path); continue; }
 		snprintf(a, sizeof a, "relay:%s", path);
-		list_add(l, name, K_PLAY, a);
+		/* IPTV channels carry video; the Playdate plays it dithered through the relay (Right = audio only) */
+		list_add(l, name, strncmp(path, "/iptv/stream/", 13) ? K_PLAY : K_PLAY_VIDEO, a);
 	}
 	if (!l->n) { list_free(l); show_msg("Nothing found.", NULL); return; }
 	push(l);
@@ -311,23 +335,43 @@ static void parse_relay_list(Req* r)   /* [{"name": "...", "path": "/t.mp3?..."}
 
 /* ---------- playback ---------- */
 
+static Ring audioRing;                 /* video mode: demuxed MP3 for the audio thread */
+static bool videoActive;
+typedef struct { uint32_t pts; bool key; uint32_t len; uint8_t* data; } VFrame;
+static VFrame vq[VQ_MAX];
+static int vqHead, vqCount;
+static uint8_t frameBuf[FRAME_BYTES];  /* the dithered picture, row stride LCD_ROWSIZE */
+static bool vHaveT0, vGotFrame, videoFellBack;
+static uint32_t vT0;
+
 static int data_source(uint8_t* data, int bytes, void* ud)
 {
-	Req* s = ud;
-	return s ? ring_read(s, data, bytes) : 0;
+	Ring* g = ud;
+	return g ? ring_read(g, data, bytes) : 0;
+}
+
+static void video_reset(void)
+{
+	for (int i = 0; i < vqCount; i++) xfree(vq[(vqHead + i) % VQ_MAX].data);
+	vqHead = vqCount = 0;
+	vHaveT0 = vGotFrame = false;
+	memset(frameBuf, 0, sizeof frameBuf);
+	ring_free(&audioRing);
+	videoActive = false;
 }
 
 static void stop_playback(void)
 {
 	if (player) { pd->sound->fileplayer->stop(player); pd->sound->fileplayer->freePlayer(player); player = NULL; }
 	if (stream) { net_free(stream); stream = NULL; }
+	video_reset();
 	started = false;
 }
 
 static char playTitle[80], playArg[1100];
 static bool triedRelay;
 
-static void start_playback(const char* title, const char* arg)
+static void start_playback(const char* title, const char* arg, bool video)
 {
 	static char url[URL_MAX];
 	stop_playback();
@@ -338,12 +382,26 @@ static void start_playback(const char* title, const char* arg)
 		relay_url(url, sizeof url, arg + 6);
 	} else snprintf(url, sizeof url, "%s", arg);
 	copy_ascii(nowTitle, sizeof nowTitle, title);
-	stream = net_stream(url, RING_BYTES);
+	stream = net_stream(url, video ? VIDEO_RING : RING_BYTES);
 	if (!stream) { show_msg("Out of memory", NULL); return; }
+	Ring* src = &stream->ring;
+	if (video) {
+		if (!ring_init(&audioRing, VIDEO_AUDIO_RING)) { stop_playback(); show_msg("Out of memory", NULL); return; }
+		videoActive = true;
+		src = &audioRing;
+	}
 	player = pd->sound->fileplayer->newPlayer();
 	pd->sound->fileplayer->setStopOnUnderrun(player, 0);
-	pd->sound->fileplayer->setMP3StreamSource(player, data_source, stream, 2.0f);
-	mode = M_PLAY;
+	pd->sound->fileplayer->setMP3StreamSource(player, data_source, src, 2.0f);
+	mode = video ? M_VIDEO : M_PLAY;
+}
+
+/* "/iptv/stream/7.mp3" <-> "/iptv/video/7" */
+static void video_arg(const char* audioArg, char* out, size_t sz)
+{
+	const char* n = strstr(audioArg, "/iptv/stream/");
+	if (!n) { snprintf(out, sz, "%s", audioArg); return; }
+	snprintf(out, sz, "relay:/iptv/video/%d", atoi(n + 13));
 }
 
 /* Some hosts redirect in ways the Playdate's HTTP client can't follow (very long Location headers, for one).
@@ -355,12 +413,102 @@ static void maybe_fall_back(void)
 	static char arg[1100];
 	via_relay(arg, sizeof arg, playArg);
 	char t[80]; snprintf(t, sizeof t, "%s", playTitle);
-	start_playback(t, arg);
+	start_playback(t, arg, false);
+}
+
+/* ---- video: demux the relay's packet stream, then show frames on schedule ---- */
+
+static void video_demux(uint32_t now)
+{
+	static uint8_t tmp[1024];
+	for (int guard = 0; guard < 64; guard++) {
+		uint8_t h[3];
+		if (ring_peek(&stream->ring, 0, h, 3) < 3) break;
+		uint32_t len = h[1] | ((uint32_t)h[2] << 8);
+		if (ring_fill(&stream->ring) < 3 + len) break;
+		if (!vHaveT0) { vHaveT0 = true; vT0 = now; }
+		if (h[0] == 1) {                                        /* MP3 audio */
+			if (ring_space(&audioRing) < len) break;
+			ring_read(&stream->ring, NULL, 3);
+			while (len) { uint32_t n = len < sizeof tmp ? len : sizeof tmp; ring_read(&stream->ring, tmp, (int)n); ring_put(&audioRing, tmp, n); len -= n; }
+		} else if (h[0] == 2 && len >= 5) {                     /* video frame: pts:u32 flags:u8 packbits */
+			if (vqCount >= VQ_MAX) break;
+			uint8_t pre[5];
+			ring_read(&stream->ring, NULL, 3);
+			ring_read(&stream->ring, pre, 5);
+			VFrame* f = &vq[(vqHead + vqCount) % VQ_MAX];
+			f->pts = pre[0] | (pre[1] << 8) | (pre[2] << 16) | ((uint32_t)pre[3] << 24);
+			f->key = pre[4] & 1;
+			f->len = len - 5;
+			f->data = xalloc(f->len ? f->len : 1);
+			ring_read(&stream->ring, f->data, (int)f->len);
+			vqCount++;
+		} else ring_read(&stream->ring, NULL, (int)(3 + len));   /* unknown packet: skip */
+	}
+}
+
+static void apply_frame(const VFrame* f)
+{
+	size_t o = 0, i = 0;
+	if (f->key) memset(frameBuf, 0, sizeof frameBuf);
+	while (i < f->len && o < FRAME_BYTES) {                      /* PackBits, XORed onto the previous picture */
+		uint8_t c = f->data[i++];
+		if (c < 128) {
+			size_t n = (size_t)c + 1;
+			if (i + n > f->len || o + n > FRAME_BYTES) return;
+			for (size_t k = 0; k < n; k++) frameBuf[o++] ^= f->data[i++];
+		} else if (c > 128) {
+			size_t n = 257 - (size_t)c;
+			if (i >= f->len || o + n > FRAME_BYTES) return;
+			uint8_t v = f->data[i++];
+			if (v) for (size_t k = 0; k < n; k++) frameBuf[o + k] ^= v;
+			o += n;
+		}
+	}
+}
+
+static void video_show(uint32_t now)
+{
+	bool changed = false;
+	while (vqCount) {
+		VFrame* f = &vq[vqHead];
+		if (now < vT0 + f->pts + AV_DELAY_MS) break;            /* not due yet */
+		apply_frame(f);                                          /* late frames are still applied so deltas stay correct */
+		xfree(f->data);
+		vqHead = (vqHead + 1) % VQ_MAX; vqCount--;
+		changed = vGotFrame = true;
+	}
+	if (changed) {
+		memcpy(pd->graphics->getFrame(), frameBuf, FRAME_BYTES);
+		pd->graphics->markUpdatedRows(0, 239);
+	}
 }
 
 /* ---------- actions ---------- */
 
-static void activate(Item* it)
+static void need_relay(void) { show_msg("Needs the relay: set \"relay\" in Data/settings.json (see README).", NULL); }
+
+/* source: "radio" | "pod" | "tunein" | "iptv" */
+static void run_search(const char* source, const char* query)
+{
+	static char url[900];
+	char enc[200], path[300];
+	urlenc(query, enc, sizeof enc);
+	if (!strcmp(source, "radio")) {
+		snprintf(url, sizeof url, "%s%s&name=%s", RB_BASE, relayHost[0] ? "" : "&codec=MP3", enc);
+		start_fetch(url, 160 * 1024, parse_radio, query);
+	} else if (!strcmp(source, "pod")) {
+		snprintf(url, sizeof url, "https://itunes.apple.com/search?media=podcast&limit=25&term=%s", enc);
+		start_fetch(url, 128 * 1024, parse_search, query);
+	} else {
+		if (!relayHost[0]) { need_relay(); return; }
+		snprintf(path, sizeof path, !strcmp(source, "tunein") ? "/tunein/search?q=%s" : "/iptv/channels?q=%s", enc);
+		relay_url(url, sizeof url, path);
+		start_fetch(url, 64 * 1024, parse_relay_list, query);
+	}
+}
+
+static void activate(Item* it, bool altAction)
 {
 	static char url[URL_MAX];
 	switch (it->kind) {
@@ -368,40 +516,51 @@ static void activate(Item* it)
 		case K_RADIO_Q:
 			snprintf(url, sizeof url, "%s%s%s", RB_BASE, relayHost[0] ? "" : "&codec=MP3", it->arg);
 			start_fetch(url, 160 * 1024, parse_radio, it->label); break;
-		case K_RADIO_SEARCH: case K_POD_SEARCH: case K_RELAY_SEARCH:
+		case K_RADIO_SEARCH: case K_POD_SEARCH: case K_RELAY_SEARCH: case K_IPTV_SEARCH: case K_SEARCH_ALL:
 			textKind = it->kind; textLen = 0; charIdx = 1; mode = M_TEXT; break;
+		case K_SEARCH_IN: run_search(it->arg, searchQuery); break;
 		case K_POD_CHARTS: start_fetch(APPLE_CHARTS, 96 * 1024, parse_charts, "Top podcasts"); break;
 		case K_POD_ID:
 			snprintf(url, sizeof url, "https://itunes.apple.com/lookup?id=%s", it->arg);
 			start_fetch(url, 64 * 1024, parse_lookup, it->label); break;
 		case K_POD_FEED: start_fetch(it->arg, 320 * 1024, parse_episodes, it->label); break;
-		case K_RELAY_LIST:
-			if (!relayHost[0]) { show_msg("Needs the relay: set \"relay\" in Data/settings.json (see README).", NULL); break; }
+		case K_RELAY_LIST: {
+			if (!relayHost[0]) { need_relay(); break; }
+			char title[40]; snprintf(title, sizeof title, "%s", depth ? stack[depth - 1]->title : it->label);
+			if (strstr(it->arg, "offset=") && depth > 1) pop();       /* "More..." replaces the page instead of stacking */
+			else snprintf(title, sizeof title, "%s", it->label);
 			relay_url(url, sizeof url, it->arg);
-			start_fetch(url, 64 * 1024, parse_relay_list, it->label); break;
-		case K_PLAY: triedRelay = false; start_playback(it->label, it->arg); break;
+			start_fetch(url, 64 * 1024, parse_relay_list, title); break;
+		}
+		case K_PLAY: triedRelay = false; start_playback(it->label, it->arg, false); break;
+		case K_PLAY_VIDEO:
+			triedRelay = true; videoFellBack = altAction;                 /* Right button = audio only */
+			if (altAction) start_playback(it->label, it->arg, false);
+			else { static char v[1100]; video_arg(it->arg, v, sizeof v); start_playback(it->label, v, true); }
+			break;
 		default: break;
 	}
 }
 
 static void submit_text(void)
 {
-	static char url[800]; char q[64], enc[200];
 	if (textLen == 0) { mode = M_LIST; return; }
 	textBuf[textLen] = 0;
-	urlenc(textBuf, enc, sizeof enc);
-	snprintf(q, sizeof q, "%s", textBuf);
-	if (textKind == K_RADIO_SEARCH) {
-		snprintf(url, sizeof url, "%s%s&name=%s", RB_BASE, relayHost[0] ? "" : "&codec=MP3", enc);
-		start_fetch(url, 160 * 1024, parse_radio, q);
-	} else if (textKind == K_POD_SEARCH) {
-		snprintf(url, sizeof url, "https://itunes.apple.com/search?media=podcast&limit=25&term=%s", enc);
-		start_fetch(url, 128 * 1024, parse_search, q);
-	} else {
-		if (!relayHost[0]) { show_msg("Needs the relay: set \"relay\" in Data/settings.json (see README).", NULL); return; }
-		char path[300]; snprintf(path, sizeof path, "/tunein/search?q=%s", enc);
-		relay_url(url, sizeof url, path);
-		start_fetch(url, 64 * 1024, parse_relay_list, q);
+	snprintf(searchQuery, sizeof searchQuery, "%s", textBuf);
+	switch (textKind) {
+		case K_RADIO_SEARCH: run_search("radio", searchQuery); break;
+		case K_POD_SEARCH: run_search("pod", searchQuery); break;
+		case K_RELAY_SEARCH: run_search("tunein", searchQuery); break;
+		case K_IPTV_SEARCH: run_search("iptv", searchQuery); break;
+		default: {                                                        /* search everywhere: pick where */
+			char title[40]; snprintf(title, sizeof title, "Search: %.28s", searchQuery);
+			List* l = list_new(title);
+			list_add(l, "Radio stations", K_SEARCH_IN, "radio");
+			list_add(l, "Podcasts", K_SEARCH_IN, "pod");
+			list_add(l, "TuneIn", K_SEARCH_IN, "tunein");
+			list_add(l, "IPTV channels", K_SEARCH_IN, "iptv");
+			push(l);
+		}
 	}
 }
 
@@ -453,7 +612,8 @@ static void draw_list(List* l)
 		int h = 190 * 9 / l->n; int y = 24 + (190 - h) * l->top / (l->n - 9);
 		pd->graphics->fillRect(396, y, 4, h, kColorBlack);
 	}
-	draw_footer(depth > 1 ? "A select   B back   crank scrolls" : "A select   crank scrolls");
+	bool hasVideo = l->n && l->items[l->sel].kind == K_PLAY_VIDEO;
+	draw_footer(hasVideo ? "A video  Right audio  B back" : depth > 1 ? "A select   B back   crank scrolls" : "A select   crank scrolls");
 }
 
 static void draw_play(void)
@@ -464,7 +624,7 @@ static void draw_play(void)
 	if (!stream) snprintf(st, sizeof st, "Stopped");
 	else if (stream->status < 0) snprintf(st, sizeof st, "Error: %s%s", stream->error, relayHost[0] ? "" : " (a relay may help, see README)");
 	else if (stream->total == 0) snprintf(st, sizeof st, "Connecting...");
-	else if (!started) snprintf(st, sizeof st, "Buffering %u%%", (unsigned)(ring_fill(stream) * 100 / PREBUFFER));
+	else if (!started) snprintf(st, sizeof st, "Buffering %u%%", (unsigned)(ring_fill(&stream->ring) * 100 / PREBUFFER));
 	else {
 		int t = (int)((pd->system->getCurrentTimeMilliseconds() - startedAt) / 1000);
 		snprintf(st, sizeof st, "Playing %d:%02d  (%u KB received)", t / 60, t % 60, (unsigned)stream->total / 1024);
@@ -472,7 +632,7 @@ static void draw_play(void)
 	text(st, 10, 120, kDrawModeFillBlack);
 	if (stream) {
 		pd->graphics->drawRect(10, 150, 380, 14, kColorBlack);
-		int w = (int)((uint64_t)ring_fill(stream) * 376 / stream->rsize);
+		int w = (int)((uint64_t)ring_fill(&stream->ring) * 376 / stream->ring.size);
 		pd->graphics->fillRect(12, 152, w, 10, kColorBlack);
 		text("buffer", 10, 168, kDrawModeFillBlack);
 	}
@@ -481,7 +641,8 @@ static void draw_play(void)
 
 static void draw_text_entry(void)
 {
-	draw_header(textKind == K_POD_SEARCH ? "Search podcasts" : textKind == K_RELAY_SEARCH ? "Search TuneIn" : "Search stations");
+	draw_header(textKind == K_POD_SEARCH ? "Search podcasts" : textKind == K_RELAY_SEARCH ? "Search TuneIn" :
+		textKind == K_IPTV_SEARCH ? "Search IPTV channels" : textKind == K_SEARCH_ALL ? "Search" : "Search stations");
 	char shown[40];
 	snprintf(shown, sizeof shown, "%.*s[%c]", textLen, textBuf, CHARS[charIdx] == ' ' ? '_' : CHARS[charIdx]);
 	text(shown, 20, 80, kDrawModeFillBlack);
@@ -497,7 +658,7 @@ static int update(void* ud)
 	(void)ud;
 	PDButtons cur, pushed, released;
 	pd->system->getButtonState(&cur, &pushed, &released);
-	pd->graphics->clear(kColorWhite);
+	if (mode != M_VIDEO) pd->graphics->clear(kColorWhite);
 	pd->graphics->setFont(font);
 
 	if (!accessAsked) {
@@ -522,10 +683,10 @@ static int update(void* ud)
 	}
 
 	/* streaming playback control */
-	if (stream && !started && stream->status >= 0 && ring_fill(stream) >= PREBUFFER) {
+	if (mode == M_VIDEO && stream) { uint32_t now = pd->system->getCurrentTimeMilliseconds(); video_demux(now); video_show(now); }
+	if (stream && player && !started && stream->status >= 0 && ring_fill(videoActive ? &audioRing : &stream->ring) >= (videoActive ? VIDEO_AUDIO_START : PREBUFFER)) {
 		started = true; startedAt = pd->system->getCurrentTimeMilliseconds();
 		pd->sound->fileplayer->play(player, 1);
-		pd->system->logToConsole("playback started, ring=%u", (unsigned)ring_fill(stream));
 	}
 
 	switch (mode) {
@@ -559,6 +720,29 @@ static int update(void* ud)
 			if (pushed & kButtonB) mode = M_LIST;
 			break;
 		}
+		case M_VIDEO: {
+			bool dead = stream && stream->status < 0 && vqCount == 0;
+			if (dead && !vGotFrame && !videoFellBack) {                 /* no picture at all (audio-only channel?): fall back to audio */
+				videoFellBack = true;
+				static char a[1100]; snprintf(a, sizeof a, "%s", playArg);
+				char* v = strstr(a, "/iptv/video/");
+				if (v) {
+					int n = atoi(v + 12);
+					static char audio[200]; snprintf(audio, sizeof audio, "relay:/iptv/stream/%d.mp3", n);
+					char t[80]; snprintf(t, sizeof t, "%s", playTitle);
+					start_playback(t, audio, false);
+					break;
+				}
+			}
+			if (!vGotFrame || dead) {
+				pd->graphics->clear(kColorBlack);
+				const char* m = dead ? (stream->error[0] ? stream->error : "stream ended") : "Loading video...";
+				text(m, 10, 110, kDrawModeFillWhite);
+				if (dead) text(nowTitle, 10, 130, kDrawModeFillWhite);
+			}
+			if (pushed & kButtonB) { stop_playback(); mode = M_LIST; }
+			break;
+		}
 		case M_PLAY:
 			draw_play();
 			if (pushed & kButtonB) { stop_playback(); mode = M_LIST; }
@@ -574,7 +758,8 @@ static int update(void* ud)
 			if (l->sel < l->top) l->top = l->sel;
 			if (l->sel > l->top + 8) l->top = l->sel - 8;
 			draw_list(l);
-			if ((pushed & kButtonA) && l->n) activate(&l->items[l->sel]);
+			if ((pushed & kButtonA) && l->n) activate(&l->items[l->sel], false);
+			if ((pushed & kButtonRight) && l->n && l->items[l->sel].kind == K_PLAY_VIDEO) activate(&l->items[l->sel], true);
 			if ((pushed & kButtonB) && depth > 1) pop();
 			break;
 		}

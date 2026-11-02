@@ -10,6 +10,16 @@ extern PlaydateAPI* pd;
 
 /* ---- net.c: async HTTP(S) GET (the Playdate client follows redirects itself) ---- */
 #define URL_MAX 2600
+/* Single-producer / single-consumer byte ring (the audio thread can be the consumer). */
+typedef struct { uint8_t* buf; uint32_t size; volatile uint32_t head, tail; } Ring;
+bool ring_init(Ring* g, uint32_t size);
+void ring_free(Ring* g);
+uint32_t ring_fill(Ring* g);
+uint32_t ring_space(Ring* g);
+void ring_put(Ring* g, const uint8_t* data, uint32_t n);        /* caller checked ring_space */
+int ring_read(Ring* g, uint8_t* out, int n);                     /* out == NULL discards */
+uint32_t ring_peek(Ring* g, uint32_t offset, uint8_t* out, uint32_t n);
+
 typedef struct Req Req;
 typedef void (*ReqDone)(Req* r);
 
@@ -21,10 +31,8 @@ struct Req {
 	/* buffered mode */
 	char* buf;
 	size_t len, cap, max;
-	/* stream mode: single-producer (net_update) / single-consumer (audio thread) ring */
-	uint8_t* ring;
-	uint32_t rsize;
-	volatile uint32_t head, tail;
+	/* stream mode: bytes land in `ring` (producer: net_update) */
+	Ring ring;
 	uint32_t total;
 	bool stream;
 	/* state */
@@ -41,8 +49,6 @@ Req* net_get(const char* url, size_t maxBytes, ReqDone done, void* ud);
 Req* net_stream(const char* url, size_t ringBytes);
 void net_update(void);                 /* call every frame */
 void net_free(Req* r);                 /* cancels if still running */
-uint32_t ring_fill(Req* r);
-int ring_read(Req* r, uint8_t* out, int n);
 
 /* ---- parse.c: tiny JSON / RSS scanners (no allocation) ---- */
 typedef struct { const char* s; size_t n; } Span;
