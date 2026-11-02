@@ -1,0 +1,7 @@
+{
+  "name": "airwave-relay-cloudflare",
+  "private": true,
+  "scripts": { "deploy": "wrangler deploy", "dev": "wrangler dev" },
+  "dependencies": { "@cloudflare/containers": "latest" },
+  "devDependencies": { "wrangler": "latest", "typescript": "latest", "@cloudflare/workers-types": "latest" }
+}
