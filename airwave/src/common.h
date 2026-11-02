@@ -61,6 +61,7 @@ const char* json_array_start(const char* json, const char* arrayKey);
 bool json_get_str(Span obj, const char* key, char* out, size_t outsz);
 bool json_get_text(Span obj, const char* key, char* out, size_t outsz);   /* like json_get_str but keeps \n */
 bool json_get_obj(Span obj, const char* key, Span* out);
+bool json_get_arr(Span obj, const char* key, Span* out);                   /* span covering a nested array, for json_next_object */
 long json_get_int(Span obj, const char* key, long dflt);
 
 bool rss_next_item(const char** cursor, Span* item);

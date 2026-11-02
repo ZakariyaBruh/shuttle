@@ -124,6 +124,14 @@ bool json_get_text(Span obj, const char* key, char* out, size_t outsz)
 	return true;
 }
 
+bool json_get_arr(Span obj, const char* key, Span* out)
+{
+	const char *vs, *ve; bool isStr;
+	if (!find_key(obj, key, &vs, &ve, &isStr) || isStr || *vs != '[') return false;
+	out->s = vs; out->n = (size_t)(ve - vs);
+	return true;
+}
+
 bool json_get_obj(Span obj, const char* key, Span* out)
 {
 	const char *vs, *ve; bool isStr;

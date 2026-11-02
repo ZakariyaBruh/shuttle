@@ -1,0 +1,18 @@
+{
+  // Airwave relay on Cloudflare Containers. UNTESTED: I could not deploy to a Cloudflare account from my environment.
+  // Needs: a Cloudflare account on the Workers Paid plan (Containers is not on the free plan), Docker running locally, Node 18+.
+  "name": "airwave-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-06-01",
+  "containers": [
+    {
+      "class_name": "Relay",
+      "image": "../relay/Dockerfile",
+      "max_instances": 1,
+      "instance_type": "basic"
+    }
+  ],
+  "durable_objects": { "bindings": [{ "name": "RELAY", "class_name": "Relay" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["Relay"] }]
+  // set the token with:  npx wrangler secret put AIRWAVE_TOKEN
+}

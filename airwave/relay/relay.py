@@ -2,6 +2,7 @@
 """Airwave relay: turns things the Playdate can't play (AAC, HLS, TV video, YouTube...) into small MP3 / dithered-video streams.
 
     python3 relay.py [--host 0.0.0.0] [--port 8787] [--m3u PLAYLIST_URL_OR_FILE ...] [--token SECRET] [--yt-cookies cookies.txt]
+(or set AIRWAVE_TOKEN / AIRWAVE_M3U / PORT, which is how the Docker image is configured)
 
 Needs ffmpeg and numpy (video dithering). Optional: yt-dlp + node (or deno) for YouTube playback. By default it only
 listens on this computer (127.0.0.1, fine for the simulator). For a real Playdate pass --host 0.0.0.0 so it is reachable on
@@ -157,7 +158,7 @@ def yt_list(target, n=30):
         vid = d.get("id", "")
         if not re.fullmatch(r"[\w-]{11}", vid):
             continue
-        out.append({"name": d.get("title", vid) + fmt_duration(d.get("duration")), "path": f"/yt/audio/{vid}", "video": f"/yt/video/{vid}"})
+        out.append({"name": d.get("title", vid), "sub": fmt_duration(d.get("duration")).strip(" ()") or "YouTube", "path": f"/yt/audio/{vid}", "video": f"/yt/video/{vid}"})
     return out
 
 
@@ -174,7 +175,7 @@ def ia_list(query, page=1):
     url = ("https://archive.org/advancedsearch.php?" + urllib.parse.urlencode(
         [("q", q), ("fl[]", "identifier"), ("fl[]", "title"), ("rows", 30), ("page", page), ("sort[]", "downloads desc"), ("output", "json")]))
     docs = json.loads(fetch(url))["response"]["docs"]
-    items = [{"name": d.get("title", d["identifier"])[:90], "path": f"/ia/audio/{d['identifier']}", "video": f"/ia/video/{d['identifier']}"} for d in docs]
+    items = [{"name": d.get("title", d["identifier"])[:90], "sub": str(d.get("creator", ""))[:50] if not isinstance(d.get("creator"), list) else "", "path": f"/ia/audio/{d['identifier']}", "video": f"/ia/video/{d['identifier']}"} for d in docs]
     if len(docs) == 30:
         items.append({"name": "More...", "path": "/ia/search?" + urllib.parse.urlencode({"q": query, "page": page + 1}), "kind": "list"})
     return items
@@ -192,7 +193,7 @@ def ia_media_url(ident):
 
 
 def free_list(prefix, rows):
-    return [{"name": n, "path": f"/{prefix}/audio/{i}", "video": f"/{prefix}/video/{i}"} for i, (n, _) in enumerate(rows)]
+    return [{"name": n, "sub": "Live", "path": f"/{prefix}/audio/{i}", "video": f"/{prefix}/video/{i}"} for i, (n, _) in enumerate(rows)]
 
 
 def pluto_channels():
@@ -242,7 +243,7 @@ def yt_shorts(query):
             continue
         vid = d.get("id", "")
         if re.fullmatch(r"[\w-]{11}", vid) and "/shorts/" in d.get("url", ""):
-            out.append({"name": (d.get("title") or "Short")[:90], "path": f"/yt/audio/{vid}", "video": f"/yt/video/{vid}"})
+            out.append({"name": (d.get("title") or "Short")[:90], "sub": "Short", "path": f"/yt/audio/{vid}", "video": f"/yt/video/{vid}"})
     return out
 
 
@@ -408,6 +409,14 @@ def video_packets(src, fit="contain"):
         proc.kill()
 
 
+def yt_ready():
+    try:
+        import importlib.util
+        return importlib.util.find_spec("yt_dlp") is not None and bool(shutil.which("node") or shutil.which("deno"))
+    except Exception:
+        return False
+
+
 def ascii_msg(e):
     """HTTP status lines are latin-1 only; yt-dlp errors often contain curly quotes."""
     return str(e).replace("\n", " ")[:100].encode("ascii", "replace").decode()
@@ -459,6 +468,9 @@ class Handler(BaseHTTPRequestHandler):
         if TOKEN and q.get("k", [""])[0] != TOKEN:
             return self.send_error(403, "bad token")
         try:
+            if u.path == "/health":
+                return self.send_json({"ok": True, "version": "3", "video": "yes" if (np is not None and shutil.which("ffmpeg")) else "no",
+                                       "yt": "yes" if yt_ready() else "no", "ffmpeg": "yes" if shutil.which("ffmpeg") else "no"})
             if u.path == "/t.mp3":
                 if not re.match(r"https?://", q["u"][0]):
                     raise ValueError("http(s) URLs only")
@@ -475,8 +487,8 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/iptv/channels":
                 off, term = int(q.get("offset", ["0"])[0]), q.get("q", [""])[0].lower()
                 group = q.get("group", [None])[0]
-                rows = [(i, n) for i, (n, _, g) in enumerate(CHANNELS) if term in n.lower() and (group is None or g == group)]
-                page = [{"name": n, "path": f"/iptv/audio/{i}", "video": f"/iptv/video/{i}"} for i, n in rows[off:off + 39]]
+                rows = [(i, n, g) for i, (n, _, g) in enumerate(CHANNELS) if term in n.lower() and (group is None or g == group)]
+                page = [{"name": n, "sub": g, "path": f"/iptv/audio/{i}", "video": f"/iptv/video/{i}"} for i, n, g in rows[off:off + 39]]
                 if off + 39 < len(rows):
                     more = {k: v[0] for k, v in q.items() if k not in ("offset", "k")}
                     more["offset"] = off + 39
@@ -499,7 +511,7 @@ class Handler(BaseHTTPRequestHandler):
                 src = low_variant(src)
                 return self.stream(src) if mode == "audio" else self.stream_video(src, fit)
             if u.path == "/tv/shows":
-                return self.send_json([{"name": n, "path": "/yt/channel?c=" + urllib.parse.quote(url, safe=""), "kind": "list"} for n, url in SHOWS])
+                return self.send_json([{"name": n, "sub": "YouTube channel", "path": "/yt/channel?c=" + urllib.parse.quote(url, safe=""), "kind": "list"} for n, url in SHOWS])
             if u.path == "/pluto/categories":
                 counts = {}
                 for c in pluto_channels():
@@ -508,7 +520,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(top[:40])
             if u.path == "/pluto/channels":
                 cat, term, off = q.get("cat", [None])[0], q.get("q", [""])[0].lower(), int(q.get("offset", ["0"])[0])
-                rows = [{"name": c["name"], "path": f"/pluto/audio/{c['slug']}", "video": f"/pluto/video/{c['slug']}"}
+                rows = [{"name": c["name"], "sub": c.get("category", "Live"), "path": f"/pluto/audio/{c['slug']}", "video": f"/pluto/video/{c['slug']}"}
                         for c in pluto_channels() if term in c["name"].lower() and (cat is None or c["category"] == cat)]
                 params = {k: v[0] for k, v in q.items() if k not in ("offset", "k")}
                 return self.send_json(paged(rows, off, params, "/pluto/channels"))
@@ -550,10 +562,12 @@ if __name__ == "__main__":
     ap.add_argument("--yt-cookies", help="cookies.txt for yt-dlp if YouTube asks you to sign in (bot check)")
     ap.add_argument("--token", help="require ?k=TOKEN on every request (use this when exposing the relay to the internet)")
     a = ap.parse_args()
-    TOKEN, YT_COOKIES = a.token, a.yt_cookies
-    for src in a.m3u or []:
+    TOKEN, YT_COOKIES = a.token or os.environ.get("AIRWAVE_TOKEN") or None, a.yt_cookies
+    if a.port == 8787 and os.environ.get("PORT"):
+        a.port = int(os.environ["PORT"])
+    for src in (a.m3u or []) + [x for x in os.environ.get("AIRWAVE_M3U", "").split(",") if x]:
         CHANNELS.extend(load_m3u(src))
-    if a.m3u:
+    if CHANNELS:
         print(f"loaded {len(CHANNELS)} channels")
     if np is None:
         print("numpy not found: video will use ffmpeg's plain Bayer dither (pip install numpy for the better one)")

@@ -21,7 +21,7 @@ set(PLAYDATE_GAME_NAME airwave)
 set(PLAYDATE_GAME_DEVICE airwave_DEVICE)
 project(${PLAYDATE_GAME_NAME} C ASM)
 
-set(SRC src/main.c src/net.c src/parse.c)
+set(SRC src/main.c src/ui.c src/net.c src/parse.c)
 if (TOOLCHAIN STREQUAL "armgcc")
 	add_executable(${PLAYDATE_GAME_DEVICE} ${SRC})
 	target_link_options(${PLAYDATE_GAME_DEVICE} PRIVATE --specs=nosys.specs)   # stub newlib syscalls (_kill, _getpid, ...)

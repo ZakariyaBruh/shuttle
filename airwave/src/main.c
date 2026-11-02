@@ -1,16 +1,19 @@
-/* Airwave - internet radio, Apple Podcasts, BBC, TuneIn, TV (dithered video) and an AI chat for Playdate. */
+/* Airwave - radio, podcasts, TV (dithered video), an audio library and an AI chat for Playdate.
+   App logic lives here; src/ui.c draws, src/net.c talks HTTP, src/parse.c reads JSON/RSS, Source/main.lua owns the frame loop + keyboard. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <stdarg.h>
-#include "common.h"
+#include "ui.h"
 
 PlaydateAPI* pd;
 
 #define RB_BASE "https://de1.api.radio-browser.info/json/stations/search?hidebroken=true&order=clickcount&reverse=true&limit=30&bitrateMax=192"
 #define APPLE_CHARTS "https://rss.marketingtools.apple.com/api/v2/us/podcasts/top/25/podcasts.json"
 #define POLLINATIONS "https://text.pollinations.ai/openai"
+#define TUNEIN "https://opml.radiotime.com/"
+#define BBC_WS "https://stream.live.vc.bbcmedia.co.uk/bbc_world_service"
 #define RING_BYTES (160 * 1024)
 #define PREBUFFER (48 * 1024)
 #define MAX_ITEMS 40
@@ -21,36 +24,39 @@ PlaydateAPI* pd;
 #define VQ_MAX 96
 #define FRAME_BYTES (LCD_ROWSIZE * 240)
 #define ENC_MAX (URL_MAX * 3)
+#define VERSION "2.2"
 
-typedef enum { K_NONE, K_MENU, K_RADIO_Q, K_SEARCH, K_SEARCH_ALL, K_SEARCH_IN, K_POD_CHARTS, K_POD_ID, K_POD_FEED, K_RELAY_LIST, K_PLAY, K_PLAY_VIDEO } Kind;
-typedef struct { char label[80]; char arg[1100]; Kind kind; } Item;
-typedef struct { char title[40]; Item* items; int n, sel, top; } List;
 typedef enum { M_SPLASH, M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT } Mode;
 typedef void (*Parser)(Req* r);
+static void start_playback_hook(const char* title, const char* arg);
 
-static LCDFont *fBody, *fBold, *fBig, *fTitle;
 static List* stack[8];
 static int depth;
 static Mode mode = M_SPLASH;
 static bool netAllowed, accessAsked;
 static char relayToken[48];       /* optional "relay_token", sent as ?k= (the relay's --token) */
-static char relayHost[128];       /* "host:port" or a full http(s):// URL (e.g. a Cloudflare tunnel) from Data/settings.json */
-static char msg[400];
+static char relayHost[128];       /* "host:port" or a full http(s):// URL (e.g. a Cloudflare tunnel); set in Setup or settings.json */
 static float crankAcc;
 static int homeSel;
+static float homePos;
+static char lastTest[80] = "Not tested yet";
+
+/* message cards */
+static char msg[400], msgTitle[40] = "Heads up";
+static IconId msgIcon = IC_INFO;
+static int msgAction;             /* 1 = A opens Setup */
 
 /* loading */
 static Req* pending;
 static Parser pendingParser;
 static char pendingTitle[40];
 
-/* text entry (on-screen keyboard) */
+/* text entry (system keyboard, see main.lua) */
 static char textBuf[128];
 static int textLen, textMax;
-static char textSource[16];       /* "radio" "pod" "tunein" "iptv" "yt" "ia" "all" "chat" */
-static bool kbWant, kbActive, kbVisible;   /* system keyboard (Lua): wanted / in use / currently on screen */
+static char textSource[16];       /* "radio" "pod" "tunein" "lib" "iptv" "yt" "ia" "pluto" "shorts" "all" "chat" "relay" "token" */
+static bool kbWant, kbActive, kbVisible;
 static int kbCaps;
-static int viewW = 400;                    /* width left of the keyboard while it slides in; the whole UI lays out in this */
 static char searchQuery[28];
 
 /* playback */
@@ -58,12 +64,10 @@ static FilePlayer* player;
 static Req* stream;
 static bool started;
 static uint32_t startedAt;
-static char nowTitle[80];
+static char nowTitle[80], nowSub[56];
 
 /* ---------- helpers ---------- */
 
-/* Opt-in breadcrumbs: set "debug": true in settings.json and the app appends what it is doing to Data/<bundle>/airwave.log, so a
-   hardware crash can be located (the last lines show the last thing that happened). */
 static bool debugOn;
 static void dbg(const char* fmt, ...)
 {
@@ -76,19 +80,8 @@ static void dbg(const char* fmt, ...)
 	pd->file->close(f);
 }
 
-
 static void* xalloc(size_t n) { return pd->system->realloc(NULL, n); }
 static void xfree(void* p) { if (p) pd->system->realloc(p, 0); }
-static uint32_t now_ms(void) { return pd->system->getCurrentTimeMilliseconds(); }
-
-static void T(LCDFont* f, const char* s, int x, int y, LCDBitmapDrawMode m)
-{
-	if (f) pd->graphics->setFont(f);
-	pd->graphics->setDrawMode(m);
-	pd->graphics->drawText(s, strlen(s), kUTF8Encoding, x, y);
-}
-static int TW(LCDFont* f, const char* s) { return f ? pd->graphics->getTextWidth(f, s, strlen(s), kUTF8Encoding, 0) : (int)strlen(s) * 7; }
-static void Tc(LCDFont* f, const char* s, int cx, int y, LCDBitmapDrawMode m) { T(f, s, cx - TW(f, s) / 2, y, m); }
 
 static void urlenc(const char* s, char* out, size_t sz)
 {
@@ -103,10 +96,27 @@ static void urlenc(const char* s, char* out, size_t sz)
 	out[o] = 0;
 }
 
+bool relay_configured(void) { return relayHost[0] != 0; }
+
+static void show_card(IconId ic, const char* title, const char* body, int action)
+{
+	snprintf(msgTitle, sizeof msgTitle, "%s", title);
+	snprintf(msg, sizeof msg, "%s", body);
+	msgIcon = ic; msgAction = action;
+	mode = M_MSG;
+}
 static void show_msg(const char* fmt, const char* a)
 {
-	snprintf(msg, sizeof msg, fmt, a ? a : "");
-	mode = M_MSG;
+	static char t[400];
+	snprintf(t, sizeof t, fmt, a ? a : "");
+	show_card(IC_INFO, "Heads up", t, 0);
+}
+static void need_relay(const char* what)
+{
+	static char t[400];
+	snprintf(t, sizeof t, "%s needs a small helper server (the relay) to convert it for the Playdate. "
+		"Radio, podcasts, TuneIn, the Library and AI Chat all work without it.", what);
+	show_card(IC_LOCK, "Needs the relay", t, 1);
 }
 
 static List deadList;                                   /* stand-in when memory runs out */
@@ -122,15 +132,19 @@ static List* list_new(const char* title)
 	return l;
 }
 
-static Item* list_add(List* l, const char* label, Kind k, const char* arg)
+void copy_ascii(char* dst, size_t dstsz, const char* src);
+
+static Item* list_add2(List* l, const char* label, const char* sub, Kind k, const char* arg)
 {
 	if (!l->items || l->n >= MAX_ITEMS) return NULL;
 	Item* it = &l->items[l->n++];
 	copy_ascii(it->label, sizeof it->label, label);
+	copy_ascii(it->sub, sizeof it->sub, sub ? sub : "");
 	snprintf(it->arg, sizeof it->arg, "%s", arg ? arg : "");
 	it->kind = k;
 	return it;
 }
+static Item* list_add(List* l, const char* label, Kind k, const char* arg) { return list_add2(l, label, "", k, arg); }
 
 static void list_free(List* l) { if (l == &deadList) return; xfree(l->items); xfree(l); }
 
@@ -165,20 +179,46 @@ static void via_relay(char* out, size_t sz, const char* url)
 	snprintf(out, sz, "relay:/t.mp3?u=%s", enc);
 }
 
+/* Which rows are padlocked when there is no relay (they open a friendly explanation, never an error). */
+bool item_locked(const Item* it)
+{
+	if (relayHost[0]) return false;
+	switch (it->kind) {
+		case K_RELAY_LIST: case K_PLAY_VIDEO: return true;
+		case K_PLAY: return !strncmp(it->arg, "relay:", 6);
+		case K_MENU: return !strcmp(it->arg, "tv") || !strcmp(it->arg, "bbc") || !strcmp(it->arg, "iptv") || !strcmp(it->arg, "archive") || !strcmp(it->arg, "shorts");
+		case K_SEARCH_IN: return !strcmp(it->arg, "iptv") || !strcmp(it->arg, "yt") || !strcmp(it->arg, "ia") || !strcmp(it->arg, "pluto") || !strcmp(it->arg, "shorts");
+		case K_SEARCH: return !strcmp(it->arg, "iptv") || !strcmp(it->arg, "yt") || !strcmp(it->arg, "ia") || !strcmp(it->arg, "pluto") || !strcmp(it->arg, "shorts");
+		default: return false;
+	}
+}
+
+IconId item_icon(const Item* it)
+{
+	switch (it->kind) {
+		case K_SEARCH: case K_SEARCH_ALL: case K_SEARCH_IN: return IC_SEARCH;
+		case K_PLAY_VIDEO: return IC_VIDEO;
+		case K_PLAY: case K_TUNEIN_PLAY: case K_RADIO_Q: return IC_RADIO;
+		case K_POD_CHARTS: case K_POD_ID: case K_POD_FEED: return IC_POD;
+		case K_TUNEIN_LIST: return IC_TUNEIN;
+		case K_IA_Q: case K_IA_ITEM: return IC_LIB;
+		case K_RELAY_EDIT: case K_TOKEN_EDIT: return IC_SETUP;
+		case K_RELAY_TEST: return IC_CHECK;
+		case K_INFO: return IC_INFO;
+		case K_MENU:
+			if (!strcmp(it->arg, "tv") || !strcmp(it->arg, "iptv") || !strcmp(it->arg, "archive") || !strcmp(it->arg, "shorts")) return IC_TV;
+			if (!strcmp(it->arg, "bbc") || !strcmp(it->arg, "radio")) return IC_RADIO;
+			return IC_LIST;
+		default: return IC_LIST;
+	}
+}
+
 /* ---------- settings ---------- */
 
 static void load_settings(void)
 {
 	SDFile* f = pd->file->open("settings.json", kFileReadData);
-	if (!f) {
-		f = pd->file->open("settings.json", kFileWrite);
-		if (f) {
-			const char* t = "{\n  \"relay\": \"\",\n  \"relay_token\": \"\"\n}\n";
-			pd->file->write(f, t, (unsigned)strlen(t));
-			pd->file->close(f);
-		}
-		return;
-	}
+	if (!f) return;
 	static char buf[512];
 	int n = pd->file->read(f, buf, sizeof buf - 1);
 	pd->file->close(f);
@@ -187,77 +227,104 @@ static void load_settings(void)
 	Span s = { buf, (size_t)n };
 	json_get_str(s, "relay", relayHost, sizeof relayHost);
 	json_get_str(s, "relay_token", relayToken, sizeof relayToken);
-	char dbgv[16]; json_get_str(s, "debug", dbgv, sizeof dbgv);
 	debugOn = strstr(buf, "\"debug\": true") || strstr(buf, "\"debug\":true");
 }
 
+static void save_settings(void)
+{
+	SDFile* f = pd->file->open("settings.json", kFileWrite);
+	if (!f) return;
+	static char out[400];
+	int n = snprintf(out, sizeof out, "{\n  \"relay\": \"%s\",\n  \"relay_token\": \"%s\"%s\n}\n", relayHost, relayToken, debugOn ? ",\n  \"debug\": true" : "");
+	pd->file->write(f, out, (unsigned)n);
+	pd->file->close(f);
+}
+
 /* ---------- menus ---------- */
+
+static void open_setup(void);
+static void refresh_setup(void);
 
 static void open_menu(const char* id)
 {
 	List* l;
 	if (!strcmp(id, "radio")) {
 		l = list_new("Radio");
-		list_add(l, "Top stations", K_RADIO_Q, "");
-		list_add(l, "Search...", K_SEARCH, "radio");
-		const char* tags[][2] = { {"Jazz","jazz"}, {"Classical","classical"}, {"News","news"}, {"Rock","rock"}, {"Pop","pop"},
-			{"Electronic","electronic"}, {"Chillout","chillout"}, {"Talk","talk"}, {"Country","country"}, {"Hip hop","hiphop"} };
-		for (int i = 0; i < 10; i++) { char a[64]; snprintf(a, sizeof a, "&tag=%s", tags[i][1]); list_add(l, tags[i][0], K_RADIO_Q, a); }
-		list_add(l, "UK", K_RADIO_Q, "&countrycode=GB");
-		list_add(l, "USA", K_RADIO_Q, "&countrycode=US");
+		list_add2(l, "BBC World Service", "Live news, plays instantly", K_PLAY, BBC_WS);
+		list_add2(l, "Top stations", "Most popular worldwide", K_RADIO_Q, "");
+		list_add2(l, "Search stations", "By name", K_SEARCH, "radio");
+		const char* tags[][3] = { {"Jazz","jazz","Smooth to bebop"}, {"Classical","classical","Orchestras and chamber"}, {"News","news","Headlines and talk"},
+			{"Rock","rock","Guitars up"}, {"Pop","pop","Chart hits"}, {"Electronic","electronic","Beats and ambient"}, {"Chillout","chillout","Calm and downtempo"},
+			{"Talk","talk","Conversation radio"}, {"Country","country","Nashville and beyond"}, {"Hip hop","hiphop","Rap and beats"} };
+		for (int i = 0; i < 10; i++) { char a[64]; snprintf(a, sizeof a, "&tag=%s", tags[i][1]); list_add2(l, tags[i][0], tags[i][2], K_RADIO_Q, a); }
+		list_add2(l, "United Kingdom", "Local favourites", K_RADIO_Q, "&countrycode=GB");
+		list_add2(l, "United States", "Local favourites", K_RADIO_Q, "&countrycode=US");
+		list_add2(l, "More BBC stations", "Radio 1-6, 4 Extra...", K_MENU, "bbc");
 	} else if (!strcmp(id, "pod")) {
-		l = list_new("Apple Podcasts");
-		list_add(l, "Top charts", K_POD_CHARTS, "");
-		list_add(l, "Search...", K_SEARCH, "pod");
+		l = list_new("Podcasts");
+		list_add2(l, "Top charts", "What everyone is listening to", K_POD_CHARTS, "");
+		list_add2(l, "Search podcasts", "By show name", K_SEARCH, "pod");
+	} else if (!strcmp(id, "library")) {
+		l = list_new("Library");
+		list_add2(l, "Old-time radio", "Dramas, comedy and mysteries", K_IA_Q, "collection:oldtimeradio");
+		list_add2(l, "Audiobooks", "Free LibriVox readings", K_IA_Q, "collection:librivoxaudio");
+		list_add2(l, "Radio programs", "Talks and broadcasts", K_IA_Q, "collection:radioprograms");
+		list_add2(l, "Live concerts", "Taper-friendly bands", K_IA_Q, "collection:etree");
+		list_add2(l, "Spoken word", "Lectures and readings", K_IA_Q, "collection:audio_bookspoetry");
+		list_add2(l, "Search the library", "Millions of recordings", K_SEARCH, "lib");
+	} else if (!strcmp(id, "tunein")) {
+		l = list_new("TuneIn");
+		list_add2(l, "Trending", "Popular right now", K_TUNEIN_LIST, TUNEIN "Browse.ashx?c=trending&render=json");
+		list_add2(l, "Music", "By genre", K_TUNEIN_LIST, TUNEIN "Browse.ashx?c=music&render=json");
+		list_add2(l, "News", "Live news radio", K_TUNEIN_LIST, TUNEIN "Browse.ashx?c=news&render=json");
+		list_add2(l, "Talk", "Conversation and shows", K_TUNEIN_LIST, TUNEIN "Browse.ashx?c=talk&render=json");
+		list_add2(l, "Sports", "Games and commentary", K_TUNEIN_LIST, TUNEIN "Browse.ashx?c=sports&render=json");
+		list_add2(l, "Search TuneIn", "By station or topic", K_SEARCH, "tunein");
 	} else if (!strcmp(id, "bbc")) {
 		l = list_new("BBC Radio");
 		const char* st[][2] = { {"Radio 1","bbc_radio_one"}, {"Radio 2","bbc_radio_two"}, {"Radio 3","bbc_radio_three"},
 			{"Radio 4","bbc_radio_fourfm"}, {"Radio 4 Extra","bbc_radio_four_extra"}, {"Radio 5 Live","bbc_radio_five_live"},
-			{"6 Music","bbc_6music"}, {"World Service","bbc_world_service"}, {"Asian Network","bbc_asian_network"},
+			{"6 Music","bbc_6music"}, {"Asian Network","bbc_asian_network"},
 			{"Radio Scotland","bbc_radio_scotland_fm"}, {"Radio Wales","bbc_radio_wales_fm"}, {"Radio Ulster","bbc_radio_ulster"} };
-		for (int i = 0; i < 12; i++) {
+		for (int i = 0; i < 11; i++) {
 			char a[96], lab[64];
 			snprintf(a, sizeof a, "relay:/bbc/%s.mp3", st[i][1]);
 			snprintf(lab, sizeof lab, "BBC %s", st[i][0]);
-			list_add(l, lab, K_PLAY, a);
+			list_add2(l, lab, "Live (needs the relay)", K_PLAY, a);
 		}
 	} else if (!strcmp(id, "tv")) {
-		l = list_new("TV & Shows");
-		list_add(l, "Live TV channels (Pluto TV)", K_RELAY_LIST, "/pluto/categories");
-		list_add(l, "Documentary channels (YouTube)", K_RELAY_LIST, "/tv/shows");
-		list_add(l, "YouTube Shorts", K_MENU, "shorts");
-		list_add(l, "Free live news", K_RELAY_LIST, "/tv/free");
-		list_add(l, "My IPTV channels", K_MENU, "iptv");
-		list_add(l, "Internet Archive (classic TV...)", K_MENU, "archive");
-		list_add(l, "Search YouTube...", K_SEARCH, "yt");
-		list_add(l, "Search live channels...", K_SEARCH, "pluto");
+		l = list_new("TV & Video");
+		list_add2(l, "Live channels", "Pluto TV: news, movies, nature...", K_RELAY_LIST, "/pluto/categories");
+		list_add2(l, "Documentary channels", "Full episodes from YouTube", K_RELAY_LIST, "/tv/shows");
+		list_add2(l, "YouTube Shorts", "Funny, animals, wildlife", K_MENU, "shorts");
+		list_add2(l, "Free live news", "DW, Al Jazeera, Red Bull TV", K_RELAY_LIST, "/tv/free");
+		list_add2(l, "Classic TV and films", "Internet Archive", K_MENU, "archive");
+		list_add2(l, "My IPTV playlist", "Your own channels", K_MENU, "iptv");
+		list_add2(l, "Search YouTube", "Videos and episodes", K_SEARCH, "yt");
+		list_add2(l, "Search live channels", "By channel name", K_SEARCH, "pluto");
 	} else if (!strcmp(id, "shorts")) {
 		l = list_new("YouTube Shorts");
-		list_add(l, "Funny", K_RELAY_LIST, "/yt/shorts?q=funny");
-		list_add(l, "Funny animals", K_RELAY_LIST, "/yt/shorts?q=funnyanimals");
-		list_add(l, "Cats", K_RELAY_LIST, "/yt/shorts?q=cats");
-		list_add(l, "Fails", K_RELAY_LIST, "/yt/shorts?q=fails");
-		list_add(l, "Wildlife", K_RELAY_LIST, "/yt/shorts?q=wildlife");
-		list_add(l, "Nat Geo", K_RELAY_LIST, "/yt/shorts?q=%40NatGeo");
-		list_add(l, "Search shorts...", K_SEARCH, "shorts");
+		list_add2(l, "Funny", "The good stuff", K_RELAY_LIST, "/yt/shorts?q=funny");
+		list_add2(l, "Funny animals", "Pets and wildlife", K_RELAY_LIST, "/yt/shorts?q=funnyanimals");
+		list_add2(l, "Cats", "Obviously", K_RELAY_LIST, "/yt/shorts?q=cats");
+		list_add2(l, "Fails", "Ouch", K_RELAY_LIST, "/yt/shorts?q=fails");
+		list_add2(l, "Wildlife", "Nature in 60 seconds", K_RELAY_LIST, "/yt/shorts?q=wildlife");
+		list_add2(l, "Nat Geo", "From @NatGeo", K_RELAY_LIST, "/yt/shorts?q=%40NatGeo");
+		list_add2(l, "Search Shorts", "A word or #tag", K_SEARCH, "shorts");
 	} else if (!strcmp(id, "iptv")) {
 		l = list_new("My IPTV");
-		list_add(l, "Search channels...", K_SEARCH, "iptv");
-		list_add(l, "Groups", K_RELAY_LIST, "/iptv/groups");
-		list_add(l, "All channels", K_RELAY_LIST, "/iptv/channels");
+		list_add2(l, "Search channels", "By name", K_SEARCH, "iptv");
+		list_add2(l, "Groups", "Browse by category", K_RELAY_LIST, "/iptv/groups");
+		list_add2(l, "All channels", "Everything in your playlist", K_RELAY_LIST, "/iptv/channels");
 	} else if (!strcmp(id, "archive")) {
-		l = list_new("Internet Archive");
-		list_add(l, "Search...", K_SEARCH, "ia");
-		list_add(l, "Classic TV shows", K_RELAY_LIST, "/ia/search?q=collection%3Aclassic_tv");
-		list_add(l, "Classic cartoons", K_RELAY_LIST, "/ia/search?q=collection%3Aclassic_cartoons");
-		list_add(l, "NASA", K_RELAY_LIST, "/ia/search?q=collection%3Anasa");
-		list_add(l, "Vintage films (Prelinger)", K_RELAY_LIST, "/ia/search?q=collection%3Aprelinger");
-		list_add(l, "Feature films", K_RELAY_LIST, "/ia/search?q=collection%3Afeature_films");
-	} else {
-		l = list_new("TuneIn");
-		list_add(l, "Trending", K_RELAY_LIST, "/tunein/browse");
-		list_add(l, "Search...", K_SEARCH, "tunein");
-	}
+		l = list_new("Classic TV and films");
+		list_add2(l, "Search", "Internet Archive video", K_SEARCH, "ia");
+		list_add2(l, "Classic TV shows", "Westerns, sitcoms, serials", K_RELAY_LIST, "/ia/search?q=collection%3Aclassic_tv");
+		list_add2(l, "Classic cartoons", "Golden-age animation", K_RELAY_LIST, "/ia/search?q=collection%3Aclassic_cartoons");
+		list_add2(l, "NASA", "Missions and documentaries", K_RELAY_LIST, "/ia/search?q=collection%3Anasa");
+		list_add2(l, "Vintage films", "Prelinger archive", K_RELAY_LIST, "/ia/search?q=collection%3Aprelinger");
+		list_add2(l, "Feature films", "Public-domain movies", K_RELAY_LIST, "/ia/search?q=collection%3Afeature_films");
+	} else { open_setup(); return; }
 	push(l);
 }
 
@@ -282,19 +349,20 @@ static void parse_radio(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		static char name[96], url[400], codec[16], lab[96], arg[1100];
+		static char name[96], url[400], codec[16], cc[8], arg[1100], sub[56];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "url_resolved", url, sizeof url);
 		json_get_str(o, "codec", codec, sizeof codec);
+		json_get_str(o, "countrycode", cc, sizeof cc);
 		long br = json_get_int(o, "bitrate", 0);
 		if (!name[0] || !url[0]) continue;
 		bool mp3 = strcasecmp(codec, "MP3") == 0;
 		if (mp3) snprintf(arg, sizeof arg, "%s", url);
 		else if (relayHost[0]) via_relay(arg, sizeof arg, url);
 		else continue;
-		snprintf(lab, sizeof lab, "%s%s", name, mp3 ? "" : " *");
-		if (br > 0 && br < 100000 && strlen(lab) < 70) { char t[24]; snprintf(t, sizeof t, " %ldk", br); strcat(lab, t); }
-		list_add(l, lab, K_PLAY, arg);
+		snprintf(sub, sizeof sub, "%s%s%s%s", cc, cc[0] ? "  " : "", br > 0 && br < 100000 ? "" : "", codec);
+		if (br > 0 && br < 100000) snprintf(sub, sizeof sub, "%s%s%ldk %s%s", cc, cc[0] ? "  -  " : "", br, codec, mp3 ? "" : " via relay");
+		list_add2(l, name, sub, K_PLAY, arg);
 	}
 	if (!l->n) { list_free(l); show_msg("No stations found.", NULL); return; }
 	push(l);
@@ -306,10 +374,11 @@ static void parse_charts(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		static char name[96], id[24];
+		static char name[96], id[24], artist[56];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "id", id, sizeof id);
-		if (name[0] && id[0]) list_add(l, name, K_POD_ID, id);
+		json_get_str(o, "artistName", artist, sizeof artist);
+		if (name[0] && id[0]) list_add2(l, name, artist, K_POD_ID, id);
 	}
 	if (!l->n) { list_free(l); show_msg("Couldn't read the charts.", NULL); return; }
 	push(l);
@@ -321,10 +390,11 @@ static void parse_search(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		static char name[96], feed[520];
+		static char name[96], feed[520], artist[56];
 		json_get_str(o, "collectionName", name, sizeof name);
 		json_get_str(o, "feedUrl", feed, sizeof feed);
-		if (name[0] && feed[0]) list_add(l, name, K_POD_FEED, feed);
+		json_get_str(o, "artistName", artist, sizeof artist);
+		if (name[0] && feed[0]) list_add2(l, name, artist, K_POD_FEED, feed);
 	}
 	if (!l->n) { list_free(l); show_msg("No podcasts found.", NULL); return; }
 	push(l);
@@ -336,16 +406,18 @@ static void parse_episodes(Req* r)
 	const char* cur = r->buf; Span item;
 	int skipped = 0;
 	while (l->n < MAX_ITEMS && rss_next_item(&cur, &item)) {
-		static char url[1000], title[96], arg[1100]; bool mp3;
+		static char url[1000], title[96], arg[1100], date[40]; bool mp3;
 		if (!rss_enclosure(item, url, sizeof url, &mp3)) continue;
 		if (!mp3 && !relayHost[0]) { skipped++; continue; }
 		if (!rss_tag_text(item, "title", title, sizeof title)) snprintf(title, sizeof title, "Episode");
+		if (!rss_tag_text(item, "pubDate", date, sizeof date)) date[0] = 0;
+		if (strlen(date) > 16) date[16] = 0;
 		if (mp3) snprintf(arg, sizeof arg, "%s", url); else via_relay(arg, sizeof arg, url);
-		list_add(l, title, K_PLAY, arg);
+		list_add2(l, title, date, K_PLAY, arg);
 	}
 	if (!l->n) {
 		list_free(l);
-		show_msg(skipped ? "This show only has AAC/M4A episodes, which the Playdate can't play (a relay can convert them)." : "No episodes found.", NULL);
+		show_msg(skipped ? "This show only has AAC/M4A episodes, which the Playdate can't play (the relay can convert them)." : "No episodes found.", NULL);
 		return;
 	}
 	push(l);
@@ -361,25 +433,168 @@ static void parse_lookup(Req* r)
 	start_fetch(feed, 320 * 1024, parse_episodes, title);
 }
 
-/* relay list: [{"name", "path", "video"?, "kind"?}] - "kind":"list" opens another list, "video" marks a TV item */
+/* relay list: [{"name", "sub"?, "path", "video"?, "kind"?}] - "kind":"list" opens another list, "video" marks a TV item */
 static void parse_relay_list(Req* r)
 {
 	const char* arr = json_array_start(r->buf, NULL);
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		static char name[120], path[480], video[200], kind[16], a[500];
+		static char name[120], sub[56], path[480], video[200], kind[16], a[500];
 		json_get_str(o, "name", name, sizeof name);
+		json_get_str(o, "sub", sub, sizeof sub);
 		json_get_str(o, "path", path, sizeof path);
 		json_get_str(o, "video", video, sizeof video);
 		json_get_str(o, "kind", kind, sizeof kind);
 		if (!name[0] || !path[0]) continue;
-		if (!strcmp(kind, "list")) { list_add(l, name, K_RELAY_LIST, path); continue; }
-		if (video[0]) { snprintf(a, sizeof a, "relay:%s", video); list_add(l, name, K_PLAY_VIDEO, a); }
-		else { snprintf(a, sizeof a, "relay:%s", path); list_add(l, name, K_PLAY, a); }
+		if (!strcmp(kind, "list")) { list_add2(l, name, sub, K_RELAY_LIST, path); continue; }
+		if (video[0]) { snprintf(a, sizeof a, "relay:%s", video); list_add2(l, name, sub, K_PLAY_VIDEO, a); }
+		else { snprintf(a, sizeof a, "relay:%s", path); list_add2(l, name, sub, K_PLAY, a); }
 	}
 	if (!l->n) { list_free(l); show_msg("Nothing found.", NULL); return; }
 	push(l);
+}
+
+/* ---- TuneIn, straight from its public directory (no relay) ---- */
+
+static void add_tunein_obj(List* l, Span o)
+{
+	static char type[16], text[96], subtext[56], id[24], url[300], formats[40];
+	json_get_str(o, "type", type, sizeof type);
+	json_get_str(o, "text", text, sizeof text);
+	if (!text[0]) return;
+	if (!strcmp(type, "link")) {
+		json_get_str(o, "URL", url, sizeof url);
+		if (!url[0] || l->n >= MAX_ITEMS) return;
+		static char full[360]; snprintf(full, sizeof full, "%s%srender=json", url, strchr(url, '?') ? "&" : "?");
+		list_add2(l, text, "", K_TUNEIN_LIST, full);
+	} else if (!strcmp(type, "audio")) {
+		json_get_str(o, "guide_id", id, sizeof id);
+		json_get_str(o, "subtext", subtext, sizeof subtext);
+		json_get_str(o, "formats", formats, sizeof formats);
+		if (id[0] != 's' || l->n >= MAX_ITEMS) return;                   /* stations only */
+		if (!relayHost[0] && !strstr(formats, "mp3")) return;           /* AAC/HLS stations need the relay */
+		list_add2(l, text, subtext, K_TUNEIN_PLAY, id);
+	}
+}
+
+static void parse_tunein(Req* r)
+{
+	const char* arr = json_array_start(r->buf, "body");
+	List* l = list_new(pendingTitle);
+	const char* cur = arr; Span o;
+	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
+		Span kids;
+		if (json_get_arr(o, "children", &kids)) {
+			const char* kc = kids.s; Span k;
+			while (l->n < MAX_ITEMS && json_next_object(&kc, kids.s + kids.n, &k)) add_tunein_obj(l, k);
+		} else add_tunein_obj(l, o);
+	}
+	if (!l->n) { list_free(l); show_msg("Nothing playable here. (Some stations need the relay.)", NULL); return; }
+	push(l);
+}
+
+static char tuneTitle[80];
+
+static void parse_tunein_tune(Req* r)
+{
+	const char* arr = json_array_start(r->buf, "body");
+	const char* cur = arr; Span o;
+	while (arr && json_next_object(&cur, r->buf + r->len, &o)) {
+		static char url[700], media[16], arg[1100];
+		json_get_str(o, "url", url, sizeof url);
+		json_get_str(o, "media_type", media, sizeof media);
+		if (!url[0]) continue;
+		if (!strcmp(media, "mp3") || strstr(url, ".mp3")) { start_playback_hook(tuneTitle, url); return; }
+		if (relayHost[0]) { via_relay(arg, sizeof arg, url); start_playback_hook(tuneTitle, arg); return; }
+		need_relay("This station (it streams AAC)");
+		return;
+	}
+	show_msg("TuneIn didn't return a stream for this station.", NULL);
+}
+
+/* ---- Internet Archive audio, straight from archive.org (no relay) ---- */
+
+static char iaId[80], iaTitle[40];
+
+static void parse_ia_list(Req* r)
+{
+	const char* arr = json_array_start(r->buf, "docs");
+	List* l = list_new(pendingTitle);
+	const char* cur = arr; Span o;
+	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
+		static char id[80], title[96], creator[56];
+		json_get_str(o, "identifier", id, sizeof id);
+		json_get_str(o, "title", title, sizeof title);
+		json_get_str(o, "creator", creator, sizeof creator);
+		if (id[0]) list_add2(l, title[0] ? title : id, creator, K_IA_ITEM, id);
+	}
+	if (!l->n) { list_free(l); show_msg("Nothing found in the library.", NULL); return; }
+	push(l);
+}
+
+static void fmt_length(const char* len, char* out, size_t sz)
+{
+	out[0] = 0;
+	if (!len[0]) return;
+	if (strchr(len, ':')) { snprintf(out, sz, "%s", len); return; }
+	int s = atoi(len);
+	if (s <= 0) return;
+	if (s >= 3600) snprintf(out, sz, "%d:%02d:%02d", s / 3600, (s / 60) % 60, s % 60); else snprintf(out, sz, "%d:%02d", s / 60, s % 60);
+}
+
+static void parse_ia_files(Req* r)
+{
+	const char* arr = json_array_start(r->buf, "files");
+	static char fmtWant[24];
+	fmtWant[0] = 0;
+	/* an item usually holds several MP3 derivatives of the same audio: keep one family ("VBR MP3" if present) */
+	for (int pass = 0; pass < 2 && arr; pass++) {
+		const char* cur = arr; Span o;
+		while (json_next_object(&cur, r->buf + r->len, &o)) {
+			static char f[24];
+			json_get_str(o, "format", f, sizeof f);
+			if (!strstr(f, "MP3")) continue;
+			if (pass == 0 && !strcmp(f, "VBR MP3")) { snprintf(fmtWant, sizeof fmtWant, "%s", f); break; }
+			if (pass == 1 && !fmtWant[0]) { snprintf(fmtWant, sizeof fmtWant, "%s", f); break; }
+		}
+		if (fmtWant[0]) break;
+	}
+	List* l = list_new(pendingTitle);
+	if (arr && fmtWant[0]) {
+		const char* cur = arr; Span o;
+		while (l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
+			static char f[24], name[160], title[96], length[16], sub[24], enc[480], url[560];
+			json_get_str(o, "format", f, sizeof f);
+			if (strcmp(f, fmtWant)) continue;
+			json_get_str(o, "name", name, sizeof name);
+			json_get_str(o, "title", title, sizeof title);
+			json_get_str(o, "length", length, sizeof length);
+			if (!name[0]) continue;
+			fmt_length(length, sub, sizeof sub);
+			urlenc(name, enc, sizeof enc);
+			snprintf(url, sizeof url, "https://archive.org/download/%s/%s", iaId, enc);
+			if (!title[0]) { snprintf(title, sizeof title, "%s", name); char* dot = strrchr(title, '.'); if (dot) *dot = 0; }
+			list_add2(l, title, sub, K_PLAY, url);
+		}
+	}
+	if (!l->n) { list_free(l); show_msg("No playable audio in this item.", NULL); return; }
+	if (l->n == 1) { static char t[80], a[1100]; snprintf(t, sizeof t, "%s", l->items[0].label); snprintf(a, sizeof a, "%s", l->items[0].arg); list_free(l); start_playback_hook(t, a); return; }
+	push(l);
+}
+
+static void parse_health(Req* r)
+{
+	Span o = { r->buf, r->len };
+	const char* p = strchr(r->buf, '{'); if (p) { o.s = p; o.n = r->len - (size_t)(p - r->buf); }
+	static char ok[8], video[8], yt[8];
+	json_get_str(o, "video", video, sizeof video);
+	json_get_str(o, "yt", yt, sizeof yt);
+	bool vid = !strcmp(video, "yes"), ytok = !strcmp(yt, "yes");
+	(void)ok;
+	snprintf(lastTest, sizeof lastTest, "Connected%s%s", vid ? " - video ready" : " - audio only", ytok ? ", YouTube on" : "");
+	refresh_setup();
+	show_card(IC_CHECK, "Relay connected", lastTest, 0);
 }
 
 /* ---------- playback ---------- */
@@ -417,7 +632,7 @@ static void stop_playback(void)
 	started = false;
 }
 
-static char playTitle[80], playArg[1100];
+static char playTitle[80], playArg[1100], playSub[56];
 static List* playList;                 /* the list the current item came from: Up/Down in the player = next/previous */
 static uint32_t overlayUntil;          /* channel-name banner; armed when the first picture appears */
 static bool overlayDrawn, overlayArmed;
@@ -430,10 +645,11 @@ static void start_playback(const char* title, const char* arg, bool video)
 	snprintf(playTitle, sizeof playTitle, "%s", title);
 	snprintf(playArg, sizeof playArg, "%s", arg);
 	if (!strncmp(arg, "relay:", 6)) {
-		if (!relayHost[0]) { show_msg("This needs the relay. Put its address in Data/settings.json (see the README).", NULL); return; }
+		if (!relayHost[0]) { need_relay("This stream"); return; }
 		relay_url(url, sizeof url, arg + 6);
 	} else snprintf(url, sizeof url, "%s", arg);
 	copy_ascii(nowTitle, sizeof nowTitle, title);
+	copy_ascii(nowSub, sizeof nowSub, playSub);
 	dbg("play %s %.100s", video ? "video" : "audio", url);
 	stream = net_stream(url, video ? VIDEO_RING : RING_BYTES);
 	if (!stream) { show_msg("Out of memory", NULL); return; }
@@ -469,6 +685,12 @@ static void maybe_fall_back(void)
 	via_relay(arg, sizeof arg, playArg);
 	char t[80]; snprintf(t, sizeof t, "%s", playTitle);
 	start_playback(t, arg, false);
+}
+
+static void start_playback_hook(const char* title, const char* arg)       /* TuneIn / Library: direct streams, no list to surf */
+{
+	triedRelay = false;
+	start_playback(title, arg, false);
 }
 
 /* ---- video: demux the relay's packet stream, then show frames on schedule ---- */
@@ -549,6 +771,7 @@ static void video_show(uint32_t now)
 	}
 }
 
+
 /* ---------- AI chat (pollinations.ai, no key) ---------- */
 
 #define CHAT_MAX 10
@@ -558,10 +781,12 @@ static bool chatUser[CHAT_MAX];
 static int chatN;
 static Req* chatReq;
 static char chatLines[CHAT_LINES][80];
-static uint8_t chatStyle[CHAT_LINES];     /* 0 = assistant, 1 = you, 2 = notice */
-static int chatLineN, chatScroll;
-static bool chatDirty = true;
-static int chatWrapW = 372, chatWrapBuilt = 372;
+static int16_t chatLineW[CHAT_LINES];
+static int chatLineN;
+static int chatMsgFirst[CHAT_MAX], chatMsgCount[CHAT_MAX], chatMsgW[CHAT_MAX];
+static int chatScroll;                    /* pixels */
+static bool chatDirty = true, chatStick = true;
+static int chatWrapW = 300, chatWrapBuilt = 300;
 
 static void chat_add(bool user, const char* text)
 {
@@ -572,45 +797,45 @@ static void chat_add(bool user, const char* text)
 	}
 	snprintf(chatText[chatN], sizeof chatText[0], "%s", text);
 	chatUser[chatN++] = user;
-	chatDirty = true;
+	chatDirty = true; chatStick = true;
 }
 
-static void chat_add_line(const char* s, size_t n, uint8_t style)
+static void chat_add_line(const char* s, size_t n)
 {
-	if (chatLineN >= CHAT_LINES) { memmove(chatLines[0], chatLines[1], sizeof chatLines[0] * (CHAT_LINES - 1)); memmove(chatStyle, chatStyle + 1, CHAT_LINES - 1); chatLineN--; }
+	if (chatLineN >= CHAT_LINES) return;
 	snprintf(chatLines[chatLineN], sizeof chatLines[0], "%.*s", (int)n, s);
-	chatStyle[chatLineN++] = style;
+	chatLineW[chatLineN] = (int16_t)TW(fBody, chatLines[chatLineN]);
+	chatLineN++;
 }
 
 /* greedy word wrap by pixel width */
-static void chat_wrap(const char* text, uint8_t style, const char* prefix)
+static void chat_wrap(const char* text, int maxw)
 {
-	const int maxw = chatWrapW;
-	static char line[80]; line[0] = 0;
-	size_t pl = strlen(prefix);
-	bool first = true;
-	snprintf(line, sizeof line, "%s", prefix);
+	static char line[80], trial[160], word[80];
+	line[0] = 0;
 	const char* p = text;
 	while (*p) {
-		if (*p == '\n') { chat_add_line(line, strlen(line), style); snprintf(line, sizeof line, "%s", first ? "" : ""); line[0] = 0; first = false; p++; continue; }
+		if (*p == '\n') { chat_add_line(line, strlen(line)); line[0] = 0; p++; continue; }
 		const char* e = p; while (*e && *e != ' ' && *e != '\n') e++;
-		static char word[80]; size_t wl = (size_t)(e - p); if (wl > 60) wl = 60;
+		size_t wl = (size_t)(e - p); if (wl > 60) wl = 60;
 		snprintf(word, sizeof word, "%.*s", (int)wl, p);
-		static char trial[160]; snprintf(trial, sizeof trial, "%s%s%s", line, (line[0] && strcmp(line, prefix)) ? " " : "", word);
-		if (TW(fBody, trial) > maxw && line[0] && strcmp(line, prefix)) { chat_add_line(line, strlen(line), style); snprintf(line, sizeof line, "%s", word); first = false; }
+		snprintf(trial, sizeof trial, "%s%s%s", line, line[0] ? " " : "", word);
+		if (TW(fBody, trial) > maxw && line[0]) { chat_add_line(line, strlen(line)); snprintf(line, sizeof line, "%s", word); }
 		else snprintf(line, sizeof line, "%.78s", trial);
 		p = e; while (*p == ' ') p++;
 	}
-	if (line[0] && strcmp(line, prefix)) chat_add_line(line, strlen(line), style);
-	(void)pl;
+	if (line[0]) chat_add_line(line, strlen(line));
 }
 
 static void chat_rebuild(void)
 {
 	chatLineN = 0;
 	for (int i = 0; i < chatN; i++) {
-		chat_wrap(chatText[i], chatUser[i] ? 1 : 0, chatUser[i] ? "> " : "");
-		chat_add_line("", 0, 2);
+		chatMsgFirst[i] = chatLineN;
+		chat_wrap(chatText[i], chatWrapW);
+		chatMsgCount[i] = chatLineN - chatMsgFirst[i];
+		chatMsgW[i] = 0;
+		for (int k = chatMsgFirst[i]; k < chatLineN; k++) if (chatLineW[k] > chatMsgW[i]) chatMsgW[i] = chatLineW[k];
 	}
 	chatDirty = false;
 }
@@ -680,30 +905,38 @@ static void chat_poll(void)
 		chat_add(false, m);
 	} else parse_chat_reply(r);
 	net_free(r);
-	chatScroll = 1 << 20;                                        /* jump to the newest line */
+	chatStick = true;
 }
 
 static void open_chat(void)
 {
 	if (!chatN) chat_add(false, "Hi! I'm Airwave's assistant, powered by pollinations.ai. Press A to type a question.");
 	mode = M_CHAT;
-	chatScroll = 1 << 20;
+	chatStick = true;
 }
 
-/* ---------- actions ---------- */
 
-static void need_relay(void) { show_msg("This needs the relay. Put its address in Data/settings.json (see the README).", NULL); }
+/* ---------- actions ---------- */
 
 static void open_text(const char* source, int max)
 {
 	snprintf(textSource, sizeof textSource, "%s", source);
 	textLen = 0; textBuf[0] = 0; textMax = max;
 	kbWant = kbActive = true;                                    /* Lua shows the system keyboard on its next frame */
-	kbCaps = !strcmp(source, "chat");                            /* sentences for chat, plain for searches */
+	kbCaps = !strcmp(source, "chat");                            /* sentences for chat, plain for the rest */
 	if (strcmp(source, "chat")) mode = M_TEXT;                   /* chat compose happens inside the chat screen */
 }
 
-/* source: "radio" | "pod" | "tunein" | "iptv" | "yt" | "ia" */
+static void ia_query(const char* q, const char* title)
+{
+	static char url[900], raw[300], enc[420];
+	snprintf(raw, sizeof raw, "(%s) AND mediatype:audio", q);
+	urlenc(raw, enc, sizeof enc);
+	snprintf(url, sizeof url, "https://archive.org/advancedsearch.php?q=%s&fl%%5B%%5D=identifier&fl%%5B%%5D=title&fl%%5B%%5D=creator&rows=40&sort%%5B%%5D=downloads+desc&output=json", enc);
+	start_fetch(url, 96 * 1024, parse_ia_list, title);
+}
+
+/* source: radio | pod | tunein | lib (direct) ... iptv | yt | ia | pluto | shorts (relay) */
 static void run_search(const char* source, const char* query)
 {
 	static char url[900], enc[200], path[300];
@@ -714,20 +947,76 @@ static void run_search(const char* source, const char* query)
 	} else if (!strcmp(source, "pod")) {
 		snprintf(url, sizeof url, "https://itunes.apple.com/search?media=podcast&limit=25&term=%s", enc);
 		start_fetch(url, 128 * 1024, parse_search, query);
+	} else if (!strcmp(source, "tunein")) {
+		snprintf(url, sizeof url, "%sSearch.ashx?query=%s&render=json", TUNEIN, enc);
+		start_fetch(url, 96 * 1024, parse_tunein, query);
+	} else if (!strcmp(source, "lib")) {
+		ia_query(query, query);
 	} else {
-		if (!relayHost[0]) { need_relay(); return; }
-		const char* route = !strcmp(source, "tunein") ? "/tunein/search?q=%s" : !strcmp(source, "yt") ? "/yt/search?q=%s" :
-			!strcmp(source, "ia") ? "/ia/search?q=%s" : !strcmp(source, "pluto") ? "/pluto/channels?q=%s" :
-			!strcmp(source, "shorts") ? "/yt/shorts?q=%s" : "/iptv/channels?q=%s";
+		if (!relayHost[0]) { need_relay("Searching here"); return; }
+		const char* route = !strcmp(source, "yt") ? "/yt/search?q=%s" : !strcmp(source, "ia") ? "/ia/search?q=%s" :
+			!strcmp(source, "pluto") ? "/pluto/channels?q=%s" : !strcmp(source, "shorts") ? "/yt/shorts?q=%s" : "/iptv/channels?q=%s";
 		snprintf(path, sizeof path, route, enc);
 		relay_url(url, sizeof url, path);
 		start_fetch(url, 64 * 1024, parse_relay_list, query);
 	}
 }
 
+static void run_relay_test(void)
+{
+	static char url[400];
+	if (!relayHost[0]) { need_relay("Testing"); return; }
+	snprintf(lastTest, sizeof lastTest, "Testing...");
+	relay_url(url, sizeof url, "/health");
+	start_fetch(url, 4096, parse_health, "Testing the relay");
+}
+
+static void build_setup(List* l)
+{
+	static char wifi[60];
+	snprintf(wifi, sizeof wifi, "%s", pd->network->getStatus() == kWifiConnected ? "Connected" : "Not connected");
+	list_add2(l, "Relay address", relayHost[0] ? relayHost : "Not set - press A to enter", K_RELAY_EDIT, "");
+	list_add2(l, "Test the relay", lastTest, K_RELAY_TEST, "");
+	list_add2(l, "Relay token", relayToken[0] ? "Set" : "None (optional)", K_TOKEN_EDIT, "");
+	list_add2(l, "Wi-Fi", wifi, K_INFO, "Wi-Fi is set up in the Playdate's own Settings. Airwave connects to it automatically and turns it on when needed.");
+	list_add2(l, "What needs the relay?", "TV, Shorts, BBC stations", K_INFO,
+		"TV and video, YouTube Shorts and most BBC stations are converted by a small helper server (the relay). "
+		"Everything else works on its own: radio, podcasts, TuneIn, the Library, BBC World Service and AI Chat.");
+	list_add2(l, "About Airwave", "Version " VERSION, K_INFO, "Airwave for Playdate. Radio, podcasts, TV and AI chat in C, with the system keyboard. "
+		"Chat by pollinations.ai, stations by radio-browser and TuneIn, audio from the Internet Archive.");
+}
+
+static void open_setup(void) { List* l = list_new("Setup"); build_setup(l); push(l); }
+
+static void refresh_setup(void)                                 /* redraw the Setup page after a change, keeping the cursor */
+{
+	if (!depth || strcmp(stack[depth - 1]->title, "Setup")) return;
+	List* old = stack[depth - 1];
+	List* l = list_new("Setup");
+	build_setup(l);
+	l->sel = old->sel; l->selY = old->selY; l->scrollY = old->scrollY; l->primed = old->primed;
+	stack[depth - 1] = l;
+	list_free(old);
+}
+
+static void home_open(int idx)
+{
+	switch (idx) {
+		case 0: open_menu("radio"); break;
+		case 1: open_menu("pod"); break;
+		case 2: open_menu("library"); break;
+		case 3: open_menu("tunein"); break;
+		case 4: if (!relayHost[0]) need_relay("TV and video"); else open_menu("tv"); break;
+		case 5: if (!chatN) chat_add(false, "Hi! I'm Airwave's assistant, powered by pollinations.ai. Press A to type a question."); mode = M_CHAT; chatStick = true; break;
+		case 6: open_text("all", 27); break;
+		default: open_setup(); break;
+	}
+}
+
 static void activate(Item* it, bool altAction)
 {
 	static char url[URL_MAX];
+	if (item_locked(it)) { need_relay(it->kind == K_PLAY_VIDEO ? "TV and video" : it->label); return; }
 	switch (it->kind) {
 		case K_MENU: open_menu(it->arg); break;
 		case K_RADIO_Q:
@@ -742,20 +1031,33 @@ static void activate(Item* it, bool altAction)
 			start_fetch(url, 64 * 1024, parse_lookup, it->label); break;
 		case K_POD_FEED: start_fetch(it->arg, 320 * 1024, parse_episodes, it->label); break;
 		case K_RELAY_LIST: {
-			if (!relayHost[0]) { need_relay(); break; }
 			char title[40];
 			if (strstr(it->arg, "offset=") || strstr(it->arg, "page=")) { snprintf(title, sizeof title, "%s", stack[depth - 1]->title); if (depth > 1) pop(); }   /* "More..." replaces the page */
 			else snprintf(title, sizeof title, "%s", it->label);
 			relay_url(url, sizeof url, it->arg);
 			start_fetch(url, 96 * 1024, parse_relay_list, title); break;
 		}
-		case K_PLAY: triedRelay = false; playList = depth ? stack[depth - 1] : NULL; start_playback(it->label, it->arg, false); break;
+		case K_PLAY: playList = depth ? stack[depth - 1] : NULL; snprintf(playSub, sizeof playSub, "%s", it->sub); triedRelay = false; start_playback(it->label, it->arg, false); break;
 		case K_PLAY_VIDEO:
 			triedRelay = true; videoFellBack = altAction;                 /* Right button = audio only */
-			playList = depth ? stack[depth - 1] : NULL;
+			playList = depth ? stack[depth - 1] : NULL; snprintf(playSub, sizeof playSub, "%s", it->sub);
 			if (altAction) { static char a[1100]; audio_arg(it->arg, a, sizeof a); start_playback(it->label, a, false); }
 			else start_playback(it->label, it->arg, true);
 			break;
+		case K_TUNEIN_LIST: start_fetch(it->arg, 96 * 1024, parse_tunein, it->label); break;
+		case K_TUNEIN_PLAY:
+			snprintf(tuneTitle, sizeof tuneTitle, "%s", it->label); playList = depth ? stack[depth - 1] : NULL; snprintf(playSub, sizeof playSub, "%s", it->sub);
+			snprintf(url, sizeof url, "%sTune.ashx?id=%s&render=json", TUNEIN, it->arg);
+			start_fetch(url, 8192, parse_tunein_tune, "Tuning in"); break;
+		case K_IA_Q: ia_query(it->arg, it->label); break;
+		case K_IA_ITEM:
+			snprintf(iaId, sizeof iaId, "%s", it->arg); snprintf(iaTitle, sizeof iaTitle, "%s", it->label);
+			snprintf(url, sizeof url, "https://archive.org/metadata/%s", it->arg);
+			start_fetch(url, 192 * 1024, parse_ia_files, it->label); break;
+		case K_RELAY_EDIT: open_text("relay", 100); break;
+		case K_TOKEN_EDIT: open_text("token", 40); break;
+		case K_RELAY_TEST: run_relay_test(); break;
+		case K_INFO: show_card(IC_INFO, it->label, it->arg, 0); break;
 		default: break;
 	}
 }
@@ -772,8 +1074,6 @@ static void surf(int dir)
 	for (int i = l->sel + dir; i >= 0 && i < l->n; i += dir) {
 		if (l->items[i].kind != want) continue;
 		l->sel = i;
-		if (l->sel < l->top) l->top = l->sel;
-		if (l->sel > l->top + 7) l->top = l->sel - 7;
 		activate(&l->items[i], false);
 		return;
 	}
@@ -781,221 +1081,94 @@ static void surf(int dir)
 
 static void submit_text(void)
 {
-	if (textLen == 0) { mode = depth ? M_LIST : M_HOME; return; }
+	if (textLen == 0 && strcmp(textSource, "relay") && strcmp(textSource, "token")) { mode = depth ? M_LIST : M_HOME; return; }
 	textBuf[textLen] = 0;
 	if (!strcmp(textSource, "chat")) { char t[128]; snprintf(t, sizeof t, "%s", textBuf); chat_send(t); return; }
+	if (!strcmp(textSource, "relay")) {
+		static char t[128]; int k = 0;
+		for (int i = 0; textBuf[i] && k < 120; i++) if (textBuf[i] != ' ') t[k++] = textBuf[i];
+		t[k] = 0;
+		while (k > 0 && t[k - 1] == '/') t[--k] = 0;
+		if (k && strncmp(t, "http", 4) && !strchr(t, ':')) { snprintf(t + k, sizeof t - k, ":8787"); }     /* bare IP: default port */
+		snprintf(relayHost, sizeof relayHost, "%s", t);
+		save_settings();
+		snprintf(lastTest, sizeof lastTest, "%s", relayHost[0] ? "Not tested yet" : "No relay set");
+		mode = M_LIST; refresh_setup();
+		if (relayHost[0]) run_relay_test();
+		return;
+	}
+	if (!strcmp(textSource, "token")) {
+		snprintf(relayToken, sizeof relayToken, "%s", textBuf);
+		save_settings(); mode = M_LIST; refresh_setup();
+		if (relayHost[0]) run_relay_test();
+		return;
+	}
 	snprintf(searchQuery, sizeof searchQuery, "%s", textBuf);
 	if (strcmp(textSource, "all")) { run_search(textSource, searchQuery); return; }
 	char title[40]; snprintf(title, sizeof title, "Search: %.28s", searchQuery);          /* search everywhere: pick where */
 	List* l = list_new(title);
-	list_add(l, "Radio stations", K_SEARCH_IN, "radio");
-	list_add(l, "Podcasts", K_SEARCH_IN, "pod");
-	list_add(l, "Live TV channels", K_SEARCH_IN, "pluto");
-	list_add(l, "YouTube videos", K_SEARCH_IN, "yt");
-	list_add(l, "YouTube Shorts", K_SEARCH_IN, "shorts");
-	list_add(l, "Internet Archive", K_SEARCH_IN, "ia");
-	list_add(l, "TuneIn", K_SEARCH_IN, "tunein");
-	list_add(l, "My IPTV channels", K_SEARCH_IN, "iptv");
+	list_add2(l, "Radio stations", "Worldwide directory", K_SEARCH_IN, "radio");
+	list_add2(l, "Podcasts", "Apple podcasts", K_SEARCH_IN, "pod");
+	list_add2(l, "TuneIn", "Stations and shows", K_SEARCH_IN, "tunein");
+	list_add2(l, "Library", "Audiobooks and old radio", K_SEARCH_IN, "lib");
+	list_add2(l, "Live channels", "Pluto TV", K_SEARCH_IN, "pluto");
+	list_add2(l, "YouTube", "Videos and episodes", K_SEARCH_IN, "yt");
+	list_add2(l, "YouTube Shorts", "Short clips", K_SEARCH_IN, "shorts");
+	list_add2(l, "Classic TV and films", "Internet Archive", K_SEARCH_IN, "ia");
+	list_add2(l, "My IPTV channels", "Your playlist", K_SEARCH_IN, "iptv");
 	push(l);
 }
 
-/* ---------- drawing ---------- */
-
-static void header(const char* title, const char* right)
-{
-	pd->graphics->fillRect(0, 0, viewW, 24, kColorBlack);
-	int rw = (right && right[0]) ? TW(fBody, right) + 12 : 0;
-	char t[80]; snprintf(t, sizeof t, "%s", title);
-	if (TW(fBold, t) > viewW - 16 - rw) {                                                    /* shrink with the available width */
-		while (strlen(t) > 4 && TW(fBold, t) > viewW - 16 - rw - 14) t[strlen(t) - 1] = 0;
-		strcat(t, "..");
-	}
-	T(fBold, t, 8, 4, kDrawModeFillWhite);
-	if (rw) T(fBody, right, viewW - 8 - TW(fBody, right), 4, kDrawModeFillWhite);
-}
-
-static void footer(const char* hint)
-{
-	pd->graphics->fillRect(0, 218, viewW, 22, kColorWhite);
-	pd->graphics->drawLine(0, 217, viewW, 217, 1, kColorBlack);
-	char t[100]; snprintf(t, sizeof t, "%s", hint);
-	while (strlen(t) > 3 && TW(fBody, t) > viewW - 12) t[strlen(t) - 1] = 0;
-	T(fBody, t, 8, 222, kDrawModeFillBlack);
-}
-
-/* little icons, drawn in `c` (black on white, or white on a selected black tile) */
-typedef enum { I_SEARCH, I_RADIO, I_POD, I_BBC, I_TV, I_TUNEIN, I_CHAT, I_SETUP } Icon;
-
-static void draw_icon(Icon ic, int x, int y, LCDColor c)         /* ~44x44 box with top-left at x,y */
-{
-	const struct playdate_graphics* G = pd->graphics;
-	switch (ic) {
-		case I_SEARCH:
-			G->drawEllipse(x + 4, y + 2, 26, 26, 4, 0, 0, c);
-			G->drawLine(x + 26, y + 26, x + 40, y + 40, 5, c);
-			break;
-		case I_RADIO:
-			G->drawRect(x + 2, y + 12, 40, 28, c); G->drawRect(x + 3, y + 13, 38, 26, c);
-			G->drawLine(x + 8, y + 12, x + 32, y + 2, 2, c);
-			G->drawEllipse(x + 8, y + 18, 16, 16, 3, 0, 0, c);
-			for (int i = 0; i < 3; i++) G->fillRect(x + 29, y + 19 + i * 6, 9, 3, c);
-			break;
-		case I_POD:
-			G->fillEllipse(x + 15, y + 2, 14, 22, 0, 0, c);
-			G->drawEllipse(x + 8, y + 12, 28, 22, 3, 90, 270, c);
-			G->drawLine(x + 22, y + 34, x + 22, y + 41, 3, c);
-			G->drawLine(x + 13, y + 42, x + 31, y + 42, 3, c);
-			break;
-		case I_BBC:
-			for (int i = 0; i < 3; i++) { G->fillRect(x + 1 + i * 15, y + 12, 13, 18, c); }
-			G->drawLine(x + 1, y + 36, x + 43, y + 36, 2, c);
-			break;
-		case I_TV:
-			G->drawRect(x + 2, y + 10, 40, 28, c); G->drawRect(x + 3, y + 11, 38, 26, c);
-			G->fillRect(x + 8, y + 16, 22, 16, c);
-			G->drawLine(x + 16, y + 10, x + 10, y + 1, 2, c); G->drawLine(x + 28, y + 10, x + 34, y + 1, 2, c);
-			G->drawLine(x + 12, y + 41, x + 32, y + 41, 3, c);
-			break;
-		case I_TUNEIN:
-			G->fillEllipse(x + 18, y + 18, 8, 8, 0, 0, c);
-			for (int i = 1; i <= 3; i++) { int r = 5 + i * 5; G->drawEllipse(x + 22 - r, y + 22 - r, r * 2, r * 2, 3, 300, 420, c); G->drawEllipse(x + 22 - r, y + 22 - r, r * 2, r * 2, 3, 120, 240, c); }
-			break;
-		case I_CHAT:
-			G->drawRect(x + 1, y + 4, 42, 28, c); G->drawRect(x + 2, y + 5, 40, 26, c);
-			G->fillTriangle(x + 8, y + 31, x + 8, y + 42, x + 20, y + 31, c);
-			for (int i = 0; i < 3; i++) G->fillEllipse(x + 11 + i * 10, y + 14, 6, 6, 0, 0, c);
-			break;
-		case I_SETUP:
-			G->drawEllipse(x + 8, y + 8, 28, 28, 5, 0, 0, c);
-			for (int i = 0; i < 8; i++) {
-				static const int dx[8] = {0, 14, 20, 14, 0, -14, -20, -14}, dy[8] = {-20, -14, 0, 14, 20, 14, 0, -14};
-				G->fillRect(x + 20 + dx[i], y + 20 + dy[i], 4, 4, c);
-			}
-			break;
-	}
-}
-
-static void home_tile(int i, int x, int y, int w, int h, bool sel)
-{
-	static const char* names[8] = { "Search", "Radio", "Podcasts", "BBC", "TV", "TuneIn", "AI Chat", "Setup" };
-	static const Icon icons[8] = { I_SEARCH, I_RADIO, I_POD, I_BBC, I_TV, I_TUNEIN, I_CHAT, I_SETUP };
-	LCDColor ink = sel ? kColorWhite : kColorBlack;
-	if (sel) pd->graphics->fillRect(x, y, w, h, kColorBlack);
-	else { pd->graphics->drawRect(x, y, w, h, kColorBlack); pd->graphics->drawRect(x + 1, y + 1, w - 2, h - 2, kColorBlack); }
-	draw_icon(icons[i], x + (w - 44) / 2, y + 10, ink);
-	Tc(fBold, names[i], x + w / 2, y + h - 22, sel ? kDrawModeFillWhite : kDrawModeFillBlack);
-}
-
-static void draw_home(void)
-{
-	header("Airwave", relayHost[0] ? "relay on" : "no relay");
-	for (int i = 0; i < 8; i++) home_tile(i, 8 + (i % 4) * 97, 32 + (i / 4) * 92, 91, 86, i == homeSel);
-	footer("A open   D-pad / crank to move");
-}
-
-static void row_icon(Kind k, int x, int y, LCDColor c)           /* ~10x10 */
-{
-	const struct playdate_graphics* G = pd->graphics;
-	switch (k) {
-		case K_MENU: case K_RADIO_Q: case K_POD_CHARTS: G->fillTriangle(x + 2, y, x + 2, y + 10, x + 9, y + 5, c); break;
-		case K_PLAY: G->fillRect(x, y + 2, 3, 6, c); G->fillTriangle(x + 3, y + 1, x + 3, y + 9, x + 10, y + 5, c); break;
-		case K_PLAY_VIDEO: G->drawRect(x, y + 1, 11, 8, c); G->fillTriangle(x + 4, y + 3, x + 4, y + 7, x + 8, y + 5, c); break;
-		case K_SEARCH: case K_SEARCH_ALL: case K_SEARCH_IN: G->drawEllipse(x, y, 7, 7, 2, 0, 0, c); G->drawLine(x + 6, y + 6, x + 10, y + 10, 2, c); break;
-		default: G->fillRect(x, y + 1, 10, 2, c); G->fillRect(x, y + 4, 10, 2, c); G->fillRect(x, y + 7, 10, 2, c); break;
-	}
-}
-
-static void draw_list(List* l)
-{
-	char page[24] = "";
-	if (l->n > 8) snprintf(page, sizeof page, "%d / %d", l->sel + 1, l->n);
-	header(l->title, page);
-	for (int i = 0; i < 8; i++) {
-		int idx = l->top + i;
-		if (idx >= l->n) break;
-		Item* it = &l->items[idx];
-		int y = 27 + i * 24;
-		bool sel = idx == l->sel;
-		char lab[96]; snprintf(lab, sizeof lab, "%.60s", it->label);
-		if (TW(fBody, lab) > 350) {                                                          /* fit the row, with an ellipsis */
-			while (TW(fBody, lab) > 336 && strlen(lab) > 4) lab[strlen(lab) - 1] = 0;
-			while (strlen(lab) > 1 && (lab[strlen(lab) - 1] == ' ' || lab[strlen(lab) - 1] == '|' || lab[strlen(lab) - 1] == '-')) lab[strlen(lab) - 1] = 0;
-			strcat(lab, "...");
-		}
-		if (sel) pd->graphics->fillRect(4, y, 384, 22, kColorBlack);
-		else pd->graphics->drawLine(8, y + 23, 384, y + 23, 1, kColorBlack);
-		LCDColor ink = sel ? kColorWhite : kColorBlack;
-		row_icon(it->kind, 11, y + 6, ink);
-		T(fBody, lab, 28, y + 3, sel ? kDrawModeFillWhite : kDrawModeFillBlack);
-	}
-	if (l->n > 8) {                                                                          /* scrollbar */
-		int h = 190 * 8 / l->n; if (h < 12) h = 12;
-		int y = 26 + (190 - h) * l->top / (l->n - 8);
-		pd->graphics->drawLine(396, 26, 396, 216, 1, kColorBlack);
-		pd->graphics->fillRect(393, y, 6, h, kColorBlack);
-	}
-	bool v = l->n && l->items[l->sel].kind == K_PLAY_VIDEO;
-	footer(v ? "A watch    Right audio only    B back" : depth > 1 || true ? "A select    B back    crank scrolls" : "");
-}
+/* ---------- screens: player, typing, chat ---------- */
 
 static void draw_play(void)
 {
-	header("Now playing", started ? "live" : "");
-	/* title */
-	{
-		const char* s = nowTitle; int y = 32, lines = 0;
-		char line[80];
-		while (*s && lines < 3) {
-			int n = (int)strlen(s); if (n > 60) n = 60;
-			while (n > 1 && TW(fBig, (snprintf(line, sizeof line, "%.*s", n, s), line)) > 384) n--;
-			if (s[n] && n > 4) { int k = n; while (k > 1 && s[k] != ' ') k--; if (k > 4) n = k; }
-			snprintf(line, sizeof line, "%.*s", n, s);
-			T(fBig, line, 8, y, kDrawModeFillBlack);
-			y += 26; lines++; s += n; while (*s == ' ') s++;
-		}
+	ui_header("Now playing", "");
+	ui_art(14, 42, 116, nowTitle, started);
+	int x = 146, w = viewW - x - 14;
+	if (w > 40) {
+		int cx = x;
+		cx += ui_chip(cx, 42, started ? "PLAYING" : "TUNING", started) + 6;
+		if (playList) ui_chip(cx, 42, "UP/DOWN", false);
+		int lines = ui_wrap(nowTitle, x, 64, w, 3, fBig, 24, kDrawModeFillBlack);
+		if (nowSub[0]) T(fSmall, nowSub, x, 64 + lines * 24 + 2, kDrawModeFillBlack);
+		ui_eq(x, 152, w > 130 ? 130 : w, 22, started);
 	}
-	/* equaliser */
-	uint32_t t = now_ms();
-	for (int i = 0; i < 20; i++) {
-		int h = 4;
-		if (started) { uint32_t v = (t / 90 + (uint32_t)i * 37) * 2654435761u; h = 6 + (int)((v >> 24) % 52); }
-		pd->graphics->fillRect(14 + i * 19, 168 - h, 14, h, kColorBlack);
-	}
-	/* status + buffer */
-	char st[96];
+	char st[96]; uint32_t t = now_ms();
 	if (!stream) snprintf(st, sizeof st, "Stopped");
-	else if (stream->status < 0) snprintf(st, sizeof st, "%s", !strcmp(stream->error, "HTTP 502") ? "The relay couldn't open it (YouTube?)" : stream->error);
+	else if (stream->status < 0) snprintf(st, sizeof st, "%s", !strcmp(stream->error, "HTTP 502") ? "The relay couldn't open it" : stream->error);
 	else if (stream->total == 0) snprintf(st, sizeof st, "Connecting...");
 	else if (!started) snprintf(st, sizeof st, "Buffering %u%%", (unsigned)(ring_fill(&stream->ring) * 100 / PREBUFFER));
-	else { int s = (int)((t - startedAt) / 1000); snprintf(st, sizeof st, "%d:%02d", s / 60, s % 60); }
-	T(fBold, st, 8, 176, kDrawModeFillBlack);
+	else { int s = (int)((t - startedAt) / 1000); snprintf(st, sizeof st, "Playing  %d:%02d", s / 60, s % 60); }
+	T(fBold, st, 14, 169, kDrawModeFillBlack);
+	if (debugOn && stream) { static char d[200]; snprintf(d, sizeof d, "st%d hdr%d c%d cl%d r%d tot%u e:%s %.60s", stream->status, stream->headers, stream->complete, stream->closed, stream->redirects, (unsigned)stream->total, stream->error, stream->url + 8); T(fSmall, d, 4, 120, kDrawModeFillBlack); }
 	if (stream) {
-		pd->graphics->drawRect(8, 198, 384, 10, kColorBlack);
-		int w = (int)((uint64_t)ring_fill(&stream->ring) * 380 / stream->ring.size);
-		pd->graphics->fillRect(10, 200, w, 6, kColorBlack);
 		char kb[32]; snprintf(kb, sizeof kb, "%u KB", (unsigned)stream->total / 1024);
-		T(fBody, kb, 392 - TW(fBody, kb), 176, kDrawModeFillBlack);
+		T(fSmall, kb, viewW - 14 - TW(fSmall, kb), 173, kDrawModeFillBlack);
+		pd->graphics->drawRoundRect(14, 198, viewW - 28, 10, 5, 2, kColorBlack);
+		int fw = (int)((uint64_t)ring_fill(&stream->ring) * (viewW - 36) / stream->ring.size);
+		if (fw > 2) pd->graphics->fillRoundRect(18, 201, fw, 4, 2, kColorBlack);
 	}
-	footer(playList ? "Up/Down next    B stop & back" : "B stop & back");
+	ui_hints(playList ? "B Stop|UD Next or previous" : "B Stop");
 }
 
 static const char* search_title(void)
 {
-	static const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"iptv","Search my IPTV"},
-		{"yt","Search YouTube"}, {"ia","Search Internet Archive"}, {"all","Search everything"}, {"chat","Message the AI"},
-		{"pluto","Search live channels"}, {"shorts","Search Shorts (one word / #tag)"} };
-	for (int i = 0; i < 10; i++) if (!strcmp(titles[i][0], textSource)) return titles[i][1];
+	static const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"lib","Search the library"},
+		{"iptv","Search my IPTV"}, {"yt","Search YouTube"}, {"ia","Search classic TV"}, {"all","Search everything"}, {"chat","Message the AI"},
+		{"pluto","Search live channels"}, {"shorts","Search Shorts"}, {"relay","Relay address"}, {"token","Relay token"} };
+	for (int i = 0; i < 13; i++) if (!strcmp(titles[i][0], textSource)) return titles[i][1];
 	return "Search";
 }
 
 /* what you are typing, wrapped to `w` pixels; returns the number of lines drawn */
 static int draw_typed(int x, int y, int w, int maxLines)
 {
-	static char shown[160]; snprintf(shown, sizeof shown, "%.*s", textLen, textBuf);
+	static char shown[160], seg[100];
+	snprintf(shown, sizeof shown, "%.*s", textLen, textBuf);
 	int n = (int)strlen(shown), pos = 0, line = 0, endx = x;
 	while ((pos < n || line == 0) && line < maxLines) {
 		int cut = n - pos;
-		static char seg[100];
 		while (cut > 0 && TW(fBody, (snprintf(seg, sizeof seg, "%.*s", cut > 90 ? 90 : cut, shown + pos), seg)) > w) cut--;
 		if (cut == 0 && pos < n) cut = 1;
 		if (pos + cut < n && cut > 4) { int k = cut; while (k > 1 && shown[pos + k] != ' ') k--; if (k > 3) cut = k; }
@@ -1013,48 +1186,59 @@ static int draw_typed(int x, int y, int w, int maxLines)
 static void draw_text_screen(void)
 {
 	char cnt[16]; snprintf(cnt, sizeof cnt, "%d/%d", textLen, textMax);
-	header(search_title(), cnt);
-	int w = viewW - 24;
-	pd->graphics->drawRect(8, 34, viewW - 16, 74, kColorBlack);
-	pd->graphics->drawRect(9, 35, viewW - 18, 72, kColorBlack);
-	draw_typed(16, 42, w - 8, 3);
-	T(fBody, kbVisible ? "OK to search, B deletes" : "Opening keyboard...", 12, 120, kDrawModeFillBlack);
-	footer(!strcmp(textSource, "all") ? "then choose where to search" : "type, then OK");
+	ui_header(search_title(), cnt);
+	pd->graphics->drawRoundRect(10, 44, viewW - 20, 86, 12, 3, kColorBlack);
+	if (textLen == 0) ui_wrap(kbVisible ? "Type with the keyboard..." : "Opening keyboard...", 24, 56, viewW - 56, 2, fBody, 20, kDrawModeFillBlack);
+	else draw_typed(24, 56, viewW - 56, 3);
+	const char* tip = !strcmp(textSource, "relay") ? "Example: 192.168.1.20:8787 or https://name.trycloudflare.com" :
+		!strcmp(textSource, "token") ? "The same secret you started the relay with." :
+		!strcmp(textSource, "all") ? "Next you choose where to search." : "OK searches, B deletes.";
+	ui_wrap(tip, 14, 142, viewW - 28, 3, fSmall, 14, kDrawModeFillBlack);
 }
 
 static void draw_chat(void)
 {
 	bool typing = kbActive && !strcmp(textSource, "chat");
 	char cnt[16]; snprintf(cnt, sizeof cnt, "%d/%d", textLen, textMax);
-	header("AI chat - pollinations.ai", typing ? cnt : chatReq ? "thinking..." : "");
-	/* the transcript re-wraps to whatever width the keyboard leaves */
-	chatWrapW = viewW - 28;
+	ui_header("AI chat", typing ? cnt : "");
+	int maxText = viewW - 56 - 24;                                       /* the transcript re-wraps to whatever width the keyboard leaves */
+	chatWrapW = maxText;
 	if (chatWrapW != chatWrapBuilt && (abs(chatWrapW - chatWrapBuilt) >= 6 || viewW == 400)) { chatDirty = true; chatWrapBuilt = chatWrapW; }
 	if (chatDirty) chat_rebuild();
-	int composeH = typing ? 44 : 0;
-	int rows = (216 - 28 - composeH) / 18, maxScroll = chatLineN > rows ? chatLineN - rows : 0;
-	if (typing) chatScroll = maxScroll;                                  /* keep the newest lines in view while typing */
+	int top = 38, bottom = typing ? 160 : 214, areaH = bottom - top;
+	int total = 0;
+	for (int i = 0; i < chatN; i++) total += chatMsgCount[i] * 17 + 14 + 8;
+	if (chatReq) total += 38;
+	int maxScroll = total > areaH ? total - areaH : 0;
+	if (chatStick || typing) { chatScroll = maxScroll; chatStick = false; }
 	if (chatScroll > maxScroll) chatScroll = maxScroll;
 	if (chatScroll < 0) chatScroll = 0;
-	for (int i = 0; i < rows; i++) {
-		int idx = chatScroll + i;
-		if (idx >= chatLineN) break;
-		T(chatStyle[idx] == 1 ? fBold : fBody, chatLines[idx], 8, 28 + i * 18, kDrawModeFillBlack);
+	pd->graphics->setClipRect(0, top, viewW, areaH);
+	int y = top - chatScroll;
+	for (int i = 0; i < chatN; i++) {
+		int h = chatMsgCount[i] * 17 + 14, bw = chatMsgW[i] + 26;
+		int x = chatUser[i] ? viewW - 12 - bw : 12;
+		if (y + h > top - 2 && y < bottom + 2) {
+			ui_bubble(x, y, bw, h, chatUser[i]);
+			for (int k = 0; k < chatMsgCount[i]; k++)
+				T(fBody, chatLines[chatMsgFirst[i] + k], x + 13, y + 7 + k * 17, chatUser[i] ? kDrawModeFillWhite : kDrawModeFillBlack);
+		}
+		y += h + 8;
 	}
 	if (chatReq) {
-		char d[24]; snprintf(d, sizeof d, "thinking%.*s", (int)((now_ms() / 350) % 4), "...");
-		T(fBody, d, 8, 28 + (chatLineN - chatScroll < rows ? chatLineN - chatScroll : rows - 1) * 18, kDrawModeFillBlack);
+		ui_bubble(12, y, 62, 30, false);
+		int ph = (int)((now_ms() / 260) % 3);
+		for (int d = 0; d < 3; d++) pd->graphics->fillEllipse(24 + d * 14, y + 11 - (d == ph ? 3 : 0), 8, 8, 0, 0, kColorBlack);
 	}
-	if (maxScroll && !typing) {
-		int h = 180 * rows / chatLineN; if (h < 10) h = 10;
-		pd->graphics->fillRect(viewW - 4, 28 + (180 - h) * chatScroll / maxScroll, 4, h, kColorBlack);
-	}
-	if (typing) {                                                        /* input box rides at the bottom of the free area */
-		pd->graphics->drawRect(6, 216 - composeH + 2, viewW - 12, composeH - 4, kColorBlack);
-		draw_typed(12, 216 - composeH + 5, viewW - 28, 2);
-	}
-	footer(typing ? "OK sends, B deletes" : "A write    crank / up-down scroll    B back");
+	pd->graphics->clearClipRect();
+	if (viewW < 400) pd->graphics->setClipRect(0, 0, viewW, 240);
+	if (typing) {                                                        /* input box rides above the keyboard-narrowed area */
+		pd->graphics->drawRoundRect(8, 166, viewW - 16, 48, 10, 3, kColorBlack);
+		if (textLen == 0) ui_wrap("Type with the keyboard...", 20, 172, viewW - 44, 2, fBody, 18, kDrawModeFillBlack);
+		else draw_typed(20, 172, viewW - 44, 2);
+	} else ui_hints("A Write|UD Scroll|B Back");
 }
+
 
 /* ---------- splash animation and page transitions ---------- */
 
@@ -1064,20 +1248,6 @@ static void draw_chat(void)
 static LCDBitmap* oldBmp;              /* the screen we are leaving, slid out while the new one slides in */
 static struct { bool active; int dir; uint32_t t0; } trans;
 static uint32_t splashT0, fadeInT0;
-
-/* ordered-dither fade: cover the screen with `black`/white at coverage `level` 0..16 (a 4x4 Bayer mask, so it dissolves) */
-static void fade_overlay(int x, int y, int w, int h, bool black, int level)
-{
-	static const uint8_t bayer[4][4] = { {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5} };
-	if (level <= 0) return;
-	static uint8_t pat[16];                       /* 8 rows of colour then 8 rows of mask */
-	for (int r = 0; r < 8; r++) {
-		uint8_t mask = 0;
-		for (int c = 0; c < 8; c++) if (bayer[r & 3][c & 3] < level) mask |= (uint8_t)(0x80 >> c);
-		pat[r] = black ? 0x00 : 0xFF; pat[8 + r] = mask;
-	}
-	pd->graphics->fillRect(x, y, w, h, (LCDColor)(uintptr_t)pat);
-}
 
 static float ease_out(float t) { t = t < 0 ? 0 : t > 1 ? 1 : t; return 1 - (1 - t) * (1 - t) * (1 - t); }
 
@@ -1127,22 +1297,15 @@ static void draw_splash(uint32_t t)
 	int tl = 16 - (int)(16 * (t - 900) / 700.0f), gl = 16 - (int)(16 * (t - 1500) / 600.0f);
 	if (t < 900) tl = 16;
 	if (t < 1500) gl = 16;
-	fade_overlay(tx - 4, ty - 6, 230, 50, true, tl);
-	fade_overlay(tx - 4, ty + 40, 230, 36, true, gl);
-	if (t > 2500) fade_overlay(0, 0, 400, 240, false, (int)(16 * (t - 2500) / 380.0f));   /* dissolve to white, then the home screen fades in */
+	ui_fade(tx - 4, ty - 6, 230, 50, true, tl);
+	ui_fade(tx - 4, ty + 40, 230, 36, true, gl);
+	if (t > 2500) ui_fade(0, 0, 400, 240, false, (int)(16 * (t - 2500) / 380.0f));   /* dissolve to white, then the home screen fades in */
 }
+
 
 /* ---------- main loop ---------- */
 
-static void on_access(bool allowed, void* ud) { (void)ud; netAllowed = allowed; if (!allowed) show_msg("Network access was denied.", NULL); }
-
-static void show_setup(void)
-{
-	const char* wifi = pd->network->getStatus() == kWifiConnected ? "connected" : "not connected";
-	snprintf(msg, sizeof msg, "Wi-Fi: %s\nRelay: %s%s\nTo set it: edit Data/airwave/settings.json - \"relay\": \"192.168.1.20:8787\" (and \"relay_token\"). See the README.",
-		wifi, relayHost[0] ? relayHost : "not set", relayToken[0] ? " (token set)" : "");
-	mode = M_MSG;
-}
+static void on_access(bool allowed, void* ud) { (void)ud; netAllowed = allowed; if (!allowed) show_msg("Network access was denied. You can allow it again in the Playdate's Settings.", NULL); }
 
 static void list_input(List* l, PDButtons pushed)
 {
@@ -1151,12 +1314,24 @@ static void list_input(List* l, PDButtons pushed)
 	while (crankAcc < -25) { if (l->sel > 0) l->sel--; crankAcc += 25; }
 	if ((pushed & kButtonDown) && l->sel < l->n - 1) l->sel++;
 	if ((pushed & kButtonUp) && l->sel > 0) l->sel--;
-	if (l->sel < l->top) l->top = l->sel;
-	if (l->sel > l->top + 7) l->top = l->sel - 7;
 }
 
-/* One frame of the app. `left` = x of the system keyboard's left edge (400 when hidden); while it slides in the whole UI
-   re-lays itself out in the free width, so it follows the keyboard. */
+static void load_error(Req* r)
+{
+	static char m[240];
+	const char* why = r->error[0] ? r->error : "request failed";
+	if (pendingParser == parse_health) {
+		snprintf(lastTest, sizeof lastTest, "Can't reach it");
+		refresh_setup();
+		if (r->status == 403 || !strcmp(why, "HTTP 403")) snprintf(m, sizeof m, "The relay answered, but the token doesn't match. Set the same token in Setup.");
+		else snprintf(m, sizeof m, "Nothing answered at %.80s (%s). Check the address, that the relay is running, and that the Playdate is on the same Wi-Fi.", relayHost, why);
+		show_card(IC_LOCK, "Can't reach the relay", m, 0);
+		return;
+	}
+	snprintf(m, sizeof m, "%s%s", why, r->status == 502 ? " - the relay couldn't open that source" : "");
+	show_card(IC_WIFI, "Couldn't load that", m, 0);
+}
+
 static void app_update(int left, bool keyboardOn)
 {
 	static bool first = true;
@@ -1190,7 +1365,7 @@ static void app_update(int left, bool keyboardOn)
 		accessAsked = true;
 		enum accessReply a = pd->network->http->requestAccess(NULL, 0, true, "to stream radio and TV, and chat", on_access, NULL);
 		if (a == kAccessAllow) netAllowed = true;
-		else if (a == kAccessDeny) show_msg("Network access was denied.", NULL);
+		else if (a == kAccessDeny) show_msg("Network access was denied. You can allow it again in the Playdate's Settings.", NULL);
 	}
 	if (netAllowed && mode == M_LOADING && !pending && !depth) mode = M_HOME;
 
@@ -1202,7 +1377,7 @@ static void app_update(int left, bool keyboardOn)
 	if (pending && pending->finished) {
 		Req* r = pending; pending = NULL;
 		Parser p = pendingParser;
-		if (r->status < 0 || r->status >= 400) { static char m[200]; snprintf(m, sizeof m, "%s%s", r->error[0] ? r->error : "request failed", r->status == 502 ? " - the relay couldn't open that source" : ""); show_msg("Couldn't load: %s", m); }
+		if (r->status < 0 || r->status >= 400) load_error(r);
 		else if (r->len == 0) show_msg("The server sent nothing.", NULL);
 		else p(r);
 		net_free(r);
@@ -1216,60 +1391,47 @@ static void app_update(int left, bool keyboardOn)
 	}
 
 	switch (mode) {
+		case M_SPLASH: break;
 		case M_HOME: {
-			if ((pushed & kButtonRight) && homeSel % 4 < 3) homeSel++;
-			if ((pushed & kButtonLeft) && homeSel % 4 > 0) homeSel--;
-			if ((pushed & kButtonDown) && homeSel < 4) homeSel += 4;
-			if ((pushed & kButtonUp) && homeSel >= 4) homeSel -= 4;
+			int n = ui_home_count();
+			if ((pushed & kButtonRight) && homeSel < n - 1) homeSel++;
+			if ((pushed & kButtonLeft) && homeSel > 0) homeSel--;
 			float c = pd->system->getCrankChange(); crankAcc += c;
-			while (crankAcc > 30) { homeSel = (homeSel + 1) % 8; crankAcc -= 30; }
-			while (crankAcc < -30) { homeSel = (homeSel + 7) % 8; crankAcc += 30; }
-			draw_home();
-			if (pushed & kButtonA) {
-				static const char* ids[8] = { "", "radio", "pod", "bbc", "tv", "tunein", "", "" };
-				if (homeSel == 0) open_text("all", 27);
-				else if (homeSel == 6) open_chat();
-				else if (homeSel == 7) show_setup();
-				else open_menu(ids[homeSel]);
-			}
+			while (crankAcc > 32) { if (homeSel < n - 1) homeSel++; crankAcc -= 32; }
+			while (crankAcc < -32) { if (homeSel > 0) homeSel--; crankAcc += 32; }
+			homePos += (homeSel - homePos) * 0.32f;
+			if (homePos - homeSel < 0.01f && homePos - homeSel > -0.01f) homePos = (float)homeSel;
+			ui_home(homeSel, homePos);
+			if (pushed & kButtonA) home_open(homeSel);
 			break;
 		}
 		case M_LOADING:
-			if (!netAllowed) { header("Airwave", ""); T(fBody, "Waiting for network permission...", 10, 100, kDrawModeFillBlack); }
+			if (!netAllowed) { ui_header("Airwave", ""); ui_spinner(200, 100, 26); Tc(fBold, "Waiting for network permission...", 200, 146, kDrawModeFillBlack); }
 			else {
-				header(pendingTitle[0] ? pendingTitle : "Airwave", "");
-				char dots[24]; snprintf(dots, sizeof dots, "Loading%.*s", (int)((now_ms() / 400) % 4), "...");
-				T(fBig, dots, 10, 90, kDrawModeFillBlack);
-				footer("B cancel");
+				ui_header(pendingTitle[0] ? pendingTitle : "Airwave", "");
+				ui_spinner(200, 98, 26);
+				Tc(fBold, "Loading", 200, 140, kDrawModeFillBlack);
+				ui_hints("B Cancel");
 				if (pushed & kButtonB) { if (pending) { net_free(pending); pending = NULL; } mode = depth ? M_LIST : M_HOME; }
 			}
 			break;
-		case M_MSG: {
-			header("Airwave", "");
-			int y = 36; const char* s = msg;
-			while (*s) {                                                                    /* wrap by width, honour \n */
-				static char line[100]; int n = 0;
-				while (s[n] && s[n] != '\n' && n < 90 && TW(fBody, (snprintf(line, sizeof line, "%.*s", n + 1, s), line)) < 380) n++;
-				if (s[n] && s[n] != '\n') { int k = n; while (k > 1 && s[k] != ' ') k--; if (k > 4) n = k; }
-				snprintf(line, sizeof line, "%.*s", n, s);
-				T(fBody, line, 10, y, kDrawModeFillBlack); y += 20;
-				s += n; if (*s == '\n' || *s == ' ') s++;
-			}
-			footer("A / B back");
-			if (pushed & (kButtonA | kButtonB)) mode = depth ? M_LIST : M_HOME;
+		case M_MSG:
+			ui_header("Airwave", "");
+			ui_card(msgIcon, msgTitle, msg);
+			ui_hints(msgAction ? "A Set up the relay|B Back" : "A OK|B Back");
+			if (pushed & kButtonA) { Mode back = depth ? M_LIST : M_HOME; int act = msgAction; mode = back; msgAction = 0; if (act == 1) open_setup(); }
+			else if (pushed & kButtonB) { mode = depth ? M_LIST : M_HOME; msgAction = 0; }
 			break;
-		}
 		case M_TEXT:
 			draw_text_screen();
 			if (!kbActive && !kbWant) mode = depth ? M_LIST : M_HOME;     /* keyboard was cancelled */
 			break;
 		case M_CHAT: {
 			draw_chat();
-			float c = pd->system->getCrankChange(); crankAcc += c;
-			while (crankAcc > 20) { chatScroll++; crankAcc -= 20; }
-			while (crankAcc < -20) { chatScroll--; crankAcc += 20; }
-			if (pushed & kButtonDown) chatScroll += 3;
-			if (pushed & kButtonUp) chatScroll -= 3;
+			float c = pd->system->getCrankChange();
+			chatScroll += (int)(c * 1.6f);
+			if (pushed & kButtonDown) chatScroll += 36;
+			if (pushed & kButtonUp) chatScroll -= 36;
 			if ((pushed & kButtonA) && !chatReq && !kbActive) open_text("chat", 110);
 			if ((pushed & kButtonB) && !kbActive) mode = depth ? M_LIST : M_HOME;
 			break;
@@ -1285,8 +1447,13 @@ static void app_update(int left, bool keyboardOn)
 			}
 			if (!vGotFrame || dead) {
 				pd->graphics->clear(kColorBlack);
-				T(fBold, dead ? "Can't play this one" : "Loading video...", 12, 100, kDrawModeFillWhite);
-				if (dead) { T(fBody, !strcmp(stream->error, "HTTP 502") ? "The relay couldn't open it (YouTube needs yt-dlp, see README)" : stream->error[0] ? stream->error : "stream ended", 12, 124, kDrawModeFillWhite); T(fBody, nowTitle, 12, 146, kDrawModeFillWhite); }
+				pd->graphics->setDrawMode(kDrawModeFillWhite);
+				if (!dead) { ui_spinner(200, 104, 22); Tc(fBold, "Loading video...", 200, 146, kDrawModeFillWhite); T(fSmall, nowTitle, 200 - TW(fSmall, nowTitle) / 2, 168, kDrawModeFillWhite); }
+				else {
+					Tc(fBig, "Can't play this one", 200, 84, kDrawModeFillWhite);
+					Tc(fBody, !strcmp(stream->error, "HTTP 502") ? "The relay couldn't open it (YouTube needs yt-dlp)" : stream->error[0] ? stream->error : "stream ended", 200, 118, kDrawModeFillWhite);
+					Tc(fSmall, nowTitle, 200, 142, kDrawModeFillWhite);
+				}
 			}
 			if (pushed & kButtonDown) surf(1);
 			if (pushed & kButtonUp) surf(-1);
@@ -1303,9 +1470,13 @@ static void app_update(int left, bool keyboardOn)
 			if (!depth) { mode = M_HOME; break; }
 			List* l = stack[depth - 1];
 			list_input(l, pushed);
-			draw_list(l);
+			char cnt[16] = ""; if (l->n > 5) snprintf(cnt, sizeof cnt, "%d / %d", l->sel + 1, l->n);
+			ui_header(l->title, cnt);
+			ui_list(l);
+			bool v = l->n && l->items[l->sel].kind == K_PLAY_VIDEO && !item_locked(&l->items[l->sel]);
+			ui_hints(v ? "A Watch|LR Audio only|B Back" : "A Open|B Back|C Scroll");
 			if ((pushed & kButtonA) && l->n) activate(&l->items[l->sel], false);
-			if ((pushed & kButtonRight) && l->n && l->items[l->sel].kind == K_PLAY_VIDEO) activate(&l->items[l->sel], true);
+			if ((pushed & kButtonRight) && v) activate(&l->items[l->sel], true);
 			if (pushed & kButtonB) pop();
 			break;
 		}
@@ -1328,9 +1499,10 @@ static void app_update(int left, bool keyboardOn)
 	}
 	if (fadeInT0) {                                                /* home fades in from white after the splash */
 		int lv = 16 - (int)(16 * (now_ms() - fadeInT0) / 380.0f);
-		if (lv <= 0) fadeInT0 = 0; else fade_overlay(0, 0, 400, 240, false, lv);
+		if (lv <= 0) fadeInT0 = 0; else ui_fade(0, 0, 400, 240, false, lv);
 	}
 }
+
 
 /* ---------- Lua bridge: main.lua drives the loop and the system keyboard ---------- */
 
@@ -1381,18 +1553,12 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 	(void)arg;
 	if (event == kEventInit) {
 		pd = playdate;
-		const char* err;
-		fBody = pd->graphics->loadFont("/System/Fonts/Roobert-11-Medium.pft", &err);
-		fBold = pd->graphics->loadFont("/System/Fonts/Roobert-11-Bold.pft", &err);
-		fBig = pd->graphics->loadFont("/System/Fonts/Roobert-20-Medium.pft", &err);
-		fTitle = pd->graphics->loadFont("/System/Fonts/Roobert-24-Medium.pft", &err);
+		ui_load_fonts();
 		oldBmp = pd->graphics->newBitmap(400, 240, kColorWhite);
-		if (!fBody) fBody = pd->graphics->loadFont("/System/Fonts/Asheville-Sans-14-Light.pft", &err);
-		if (!fBold) fBold = fBody;
-		if (!fBig) fBig = fBold;
 		load_settings();
 		if (debugOn) { SDFile* lf = pd->file->open("airwave.log", kFileWrite); if (lf) pd->file->close(lf); }
-		dbg("init: fonts %p %p %p", (void*)fBody, (void*)fBold, (void*)fBig);
+		dbg("init: fonts %p %p %p %p", (void*)fBody, (void*)fBold, (void*)fBig, (void*)fSmall);
+		dbg("font heights: body %d bold %d small %d big %d title %d", fBody ? pd->graphics->getFontHeight(fBody) : -1, fBold ? pd->graphics->getFontHeight(fBold) : -1, fSmall ? pd->graphics->getFontHeight(fSmall) : -1, fBig ? pd->graphics->getFontHeight(fBig) : -1, fTitle ? pd->graphics->getFontHeight(fTitle) : -1);
 		pd->network->setEnabled(true, wifi_done);       /* the device may call this unconditionally, so never pass NULL */
 		/* no update callback on purpose: that makes the system start Lua, and main.lua drives the frames */
 	} else if (event == kEventInitLua) {
@@ -1406,3 +1572,4 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 	}
 	return 0;
 }
+
