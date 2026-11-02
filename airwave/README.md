@@ -2,6 +2,9 @@
 
 Radio, podcasts, TV and an AI chat on the Playdate, written in C against the Playdate SDK 3.1. Streams MP3 straight from the
 network (`fileplayer->setMP3StreamSource`) and draws dithered video straight into the framebuffer. UI font: Roobert (built into the Playdate).
+Text entry uses the **system keyboard**, which the Playdate only offers to Lua, so there is a tiny `Source/main.lua` that loads
+`CoreLibs/keyboard` and drives the frame loop; everything else is C. While the keyboard slides in, the UI re-lays itself out in the free
+width (the AI chat transcript re-wraps and the input box rides above the keyboard).
 
 | Tile | What | Needs relay? |
 |---|---|---|
@@ -9,7 +12,7 @@ network (`fileplayer->setMP3StreamSource`) and draws dithered video straight int
 | Radio | [radio-browser.info](https://www.radio-browser.info): top, genres, countries, search | only for non-MP3 stations (marked `*`) |
 | Podcasts | Apple top charts + iTunes search; episodes from the show's RSS feed | only for AAC/M4A episodes and some tracking redirects |
 | BBC | Radio 1 to 6 Music, 4 Extra, World Service, nations | yes |
-| TV | **real live channels (Pluto TV, ~450 free channels)**, Nat Geo Wild & other official shows (YouTube), **YouTube Shorts**, free live news, Internet Archive classic TV, your own IPTV list, YouTube search | yes |
+| TV | **real live channels (Pluto TV, ~450 free channels)**, documentary channels (YouTube), **YouTube Shorts**, free live news, Internet Archive classic TV, your own IPTV list, YouTube search | yes |
 | TuneIn | trending + search | yes |
 | AI Chat | [pollinations.ai](https://pollinations.ai) text API, no key; remembers the last few turns | no |
 | Setup | shows Wi-Fi and relay status | |
@@ -20,8 +23,7 @@ lineup (467 channels) and it isn't there. What you get instead:
 - **Live TV channels (Pluto TV)**: real 24/7 channels such as BBC Earth, PBS Nature, Love Nature, Naturescape, Dinos 24/7, plus news, movies,
   classic TV, kids, sport... searchable by name or browsable by category. Pluto's licensing is regional: if you see a "where to watch" card
   the channel isn't available in your country (that is what I got from my environment, so I could not verify real Pluto *content*).
-- **Nat Geo Wild & shows (YouTube)**: the official Nat Geo Wild channel is now called **Nat Geo Animals** and posts full episodes for free;
-  also National Geographic, BBC Earth, DW Documentary, Smithsonian Channel and NASA.
+- **Documentary channels (YouTube)**: official full-episode channels such as National Geographic, BBC Earth, DW Documentary, Smithsonian Channel and NASA.
 - If you have a TV subscription, the channel is in the Nat Geo app / Disney+ (they need your login, which a Playdate can't do).
 
 ### Channel surfing and Shorts
@@ -72,8 +74,8 @@ in the Simulator). It contains the device binary (`pdex.bin`) and the simulator 
 (The app was renamed from "Tuner": new bundle id `com.zakariya.airwave`, so settings from the old app aren't carried over.)
 
 ## Controls
-D-pad or crank to move, **A** select, **B** back. On TV lists: **A** watch, **Right** audio only. Keyboard: A types the key, B deletes
-(or leaves when empty), crank moves sideways, `GO` submits.
+D-pad or crank to move, **A** select, **B** back. On TV lists: **A** watch, **Right** audio only; Up/Down while watching = next/previous.
+Text entry: the standard Playdate keyboard (**OK** submits, **B** deletes, cancel/B on empty closes it).
 
 ## Build
 ```bash
@@ -88,7 +90,7 @@ Needs `gcc-arm-none-eabi` for the device build.
   dithered video with audio from your IPTV list, free live news (DW, Al Jazeera) with channel surfing, Internet Archive, the Pluto TV lists, and the relay token. **Not tested on real
   hardware** (the ARM build links and packages; Wi-Fi behaviour and memory use on the device are unverified).
 - **YouTube playback (videos and Shorts) could not be verified**: from my environment YouTube blocks yt-dlp with a bot check, so I only verified the
-  channel/hashtag/search *listings* (Nat Geo Animals episodes and funny Shorts list correctly). On a normal home connection it usually works; if not, see above.
+  channel/hashtag/search *listings* (documentary-channel episodes and funny Shorts list correctly). On a normal home connection it usually works; if not, see above.
 - Pollinations' anonymous tier is rate-limited and its model/output can change; replies drop emoji (the font is Latin-only).
 - 1-bit video is rough on fast action; audio/video sync is approximate (fixed 1.5 s offset).
 - Streams are MP3 only (the Playdate's decoder); many stations and podcast hosts only publish AAC, hence the relay.

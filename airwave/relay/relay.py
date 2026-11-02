@@ -50,10 +50,8 @@ FREE_LIVE = [      # official free live streams (URLs change now and then; add y
     ("Al Jazeera English", "https://live-hls-apps-aje-fa.getaj.net/AJE/index.m3u8"),
     ("Red Bull TV", "https://rbmn-live.akamaized.net/hls/live/590964/BoRB-AT/master.m3u8"),
 ]
-# Official YouTube channels. Nat Geo Wild's own channel is now called "Nat Geo Animals"; the linear Nat Geo Wild TV channel is
-# pay-TV only and has no legal free stream.
+# Official YouTube channels with full episodes.
 SHOWS = [
-    ("Nat Geo Wild (Nat Geo Animals)", "https://www.youtube.com/@NatGeoAnimals/videos"),
     ("National Geographic", "https://www.youtube.com/@NatGeo/videos"),
     ("BBC Earth", "https://www.youtube.com/@bbcearth/videos"),
     ("DW Documentary", "https://www.youtube.com/@DWDocumentary/videos"),

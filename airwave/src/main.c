@@ -47,9 +47,10 @@ static char pendingTitle[40];
 static char textBuf[128];
 static int textLen, textMax;
 static char textSource[16];       /* "radio" "pod" "tunein" "iptv" "yt" "ia" "all" "chat" */
-static int keyRow, keyCol;
+static bool kbWant, kbActive, kbVisible;   /* system keyboard (Lua): wanted / in use / currently on screen */
+static int kbCaps;
+static int viewW = 400;                    /* width left of the keyboard while it slides in; the whole UI lays out in this */
 static char searchQuery[28];
-static const char* KEYS[4] = { "1234567890", "qwertyuiop", "asdfghjkl'", "zxcvbnm,.?" };
 
 /* playback */
 static FilePlayer* player;
@@ -201,7 +202,7 @@ static void open_menu(const char* id)
 	} else if (!strcmp(id, "tv")) {
 		l = list_new("TV & Shows");
 		list_add(l, "Live TV channels (Pluto TV)", K_RELAY_LIST, "/pluto/categories");
-		list_add(l, "Nat Geo Wild & shows (YouTube)", K_RELAY_LIST, "/tv/shows");
+		list_add(l, "Documentary channels (YouTube)", K_RELAY_LIST, "/tv/shows");
 		list_add(l, "YouTube Shorts", K_MENU, "shorts");
 		list_add(l, "Free live news", K_RELAY_LIST, "/tv/free");
 		list_add(l, "My IPTV channels", K_MENU, "iptv");
@@ -534,6 +535,7 @@ static char chatLines[CHAT_LINES][80];
 static uint8_t chatStyle[CHAT_LINES];     /* 0 = assistant, 1 = you, 2 = notice */
 static int chatLineN, chatScroll;
 static bool chatDirty = true;
+static int chatWrapW = 372, chatWrapBuilt = 372;
 
 static void chat_add(bool user, const char* text)
 {
@@ -557,7 +559,7 @@ static void chat_add_line(const char* s, size_t n, uint8_t style)
 /* greedy word wrap by pixel width */
 static void chat_wrap(const char* text, uint8_t style, const char* prefix)
 {
-	const int maxw = 372;
+	const int maxw = chatWrapW;
 	char line[80]; line[0] = 0;
 	size_t pl = strlen(prefix);
 	bool first = true;
@@ -669,8 +671,10 @@ static void need_relay(void) { show_msg("This needs the relay. Put its address i
 static void open_text(const char* source, int max)
 {
 	snprintf(textSource, sizeof textSource, "%s", source);
-	textLen = 0; textBuf[0] = 0; textMax = max; keyRow = 1; keyCol = 0;
-	mode = M_TEXT;
+	textLen = 0; textBuf[0] = 0; textMax = max;
+	kbWant = kbActive = true;                                    /* Lua shows the system keyboard on its next frame */
+	kbCaps = !strcmp(source, "chat");                            /* sentences for chat, plain for searches */
+	if (strcmp(source, "chat")) mode = M_TEXT;                   /* chat compose happens inside the chat screen */
 }
 
 /* source: "radio" | "pod" | "tunein" | "iptv" | "yt" | "ia" */
@@ -774,16 +778,24 @@ static void submit_text(void)
 
 static void header(const char* title, const char* right)
 {
-	pd->graphics->fillRect(0, 0, 400, 24, kColorBlack);
-	T(fBold, title, 8, 4, kDrawModeFillWhite);
-	if (right && right[0]) T(fBody, right, 392 - TW(fBody, right), 4, kDrawModeFillWhite);
+	pd->graphics->fillRect(0, 0, viewW, 24, kColorBlack);
+	int rw = (right && right[0]) ? TW(fBody, right) + 12 : 0;
+	char t[80]; snprintf(t, sizeof t, "%s", title);
+	if (TW(fBold, t) > viewW - 16 - rw) {                                                    /* shrink with the available width */
+		while (strlen(t) > 4 && TW(fBold, t) > viewW - 16 - rw - 14) t[strlen(t) - 1] = 0;
+		strcat(t, "..");
+	}
+	T(fBold, t, 8, 4, kDrawModeFillWhite);
+	if (rw) T(fBody, right, viewW - 8 - TW(fBody, right), 4, kDrawModeFillWhite);
 }
 
 static void footer(const char* hint)
 {
-	pd->graphics->fillRect(0, 218, 400, 22, kColorWhite);
-	pd->graphics->drawLine(0, 217, 400, 217, 1, kColorBlack);
-	T(fBody, hint, 8, 222, kDrawModeFillBlack);
+	pd->graphics->fillRect(0, 218, viewW, 22, kColorWhite);
+	pd->graphics->drawLine(0, 217, viewW, 217, 1, kColorBlack);
+	char t[100]; snprintf(t, sizeof t, "%s", hint);
+	while (strlen(t) > 3 && TW(fBody, t) > viewW - 12) t[strlen(t) - 1] = 0;
+	T(fBody, t, 8, 222, kDrawModeFillBlack);
 }
 
 /* little icons, drawn in `c` (black on white, or white on a selected black tile) */
@@ -942,52 +954,61 @@ static void draw_play(void)
 	footer(playList ? "Up/Down next    B stop & back" : "B stop & back");
 }
 
-static void draw_keyboard(void)
+static const char* search_title(void)
 {
-	const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"iptv","Search my IPTV"},
+	static const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"iptv","Search my IPTV"},
 		{"yt","Search YouTube"}, {"ia","Search Internet Archive"}, {"all","Search everything"}, {"chat","Message the AI"},
 		{"pluto","Search live channels"}, {"shorts","Search Shorts (one word / #tag)"} };
-	const char* title = "Search";
-	for (int i = 0; i < 10; i++) if (!strcmp(titles[i][0], textSource)) title = titles[i][1];
+	for (int i = 0; i < 10; i++) if (!strcmp(titles[i][0], textSource)) return titles[i][1];
+	return "Search";
+}
+
+/* what you are typing, wrapped to `w` pixels; returns the number of lines drawn */
+static int draw_typed(int x, int y, int w, int maxLines)
+{
+	char shown[160]; snprintf(shown, sizeof shown, "%.*s", textLen, textBuf);
+	int n = (int)strlen(shown), pos = 0, line = 0, endx = x;
+	while ((pos < n || line == 0) && line < maxLines) {
+		int cut = n - pos;
+		char seg[100];
+		while (cut > 0 && TW(fBody, (snprintf(seg, sizeof seg, "%.*s", cut > 90 ? 90 : cut, shown + pos), seg)) > w) cut--;
+		if (cut == 0 && pos < n) cut = 1;
+		if (pos + cut < n && cut > 4) { int k = cut; while (k > 1 && shown[pos + k] != ' ') k--; if (k > 3) cut = k; }
+		snprintf(seg, sizeof seg, "%.*s", cut, shown + pos);
+		T(fBody, seg, x, y + line * 18, kDrawModeFillBlack);
+		endx = x + TW(fBody, seg);
+		pos += cut; while (shown[pos] == ' ') pos++;
+		line++;
+		if (pos >= n) break;
+	}
+	if ((now_ms() / 450) & 1) pd->graphics->fillRect(endx + 2, y + (line > 0 ? line - 1 : 0) * 18 + 1, 2, 15, kColorBlack);
+	return line;
+}
+
+static void draw_text_screen(void)
+{
 	char cnt[16]; snprintf(cnt, sizeof cnt, "%d/%d", textLen, textMax);
-	header(title, cnt);
-	/* text field (last ~2 lines) */
-	pd->graphics->drawRect(6, 28, 388, 52, kColorBlack);
-	{
-		char shown[160]; snprintf(shown, sizeof shown, "%.*s", textLen, textBuf);
-		const char* s = shown; int n = (int)strlen(s);
-		char l1[80], l2[80]; l1[0] = l2[0] = 0;
-		int cut = n;
-		while (cut > 0 && TW(fBody, (snprintf(l1, sizeof l1, "%.*s", cut, s), l1)) > 372) cut--;
-		snprintf(l1, sizeof l1, "%.*s", cut, s);
-		if (cut < n) snprintf(l2, sizeof l2, "%.*s", n - cut > 70 ? 70 : n - cut, s + cut);
-		T(fBody, l1, 12, 32, kDrawModeFillBlack);
-		if (l2[0]) { T(fBody, l2, 12, 50, kDrawModeFillBlack); }
-		int cx = 12 + TW(fBody, l2[0] ? l2 : l1), cy = l2[0] ? 50 : 32;
-		if ((now_ms() / 400) & 1) pd->graphics->fillRect(cx + 1, cy + 1, 2, 15, kColorBlack);
-	}
-	/* keys */
-	for (int r = 0; r < 4; r++) for (int c = 0; c < 10; c++) {
-		int x = 6 + c * 39, y = 88 + r * 25;
-		bool sel = r == keyRow && c == keyCol;
-		char k[2] = { KEYS[r][c], 0 };
-		if (sel) pd->graphics->fillRect(x, y, 37, 23, kColorBlack); else pd->graphics->drawRect(x, y, 37, 23, kColorBlack);
-		Tc(fBold, k, x + 18, y + 4, sel ? kDrawModeFillWhite : kDrawModeFillBlack);
-	}
-	struct { const char* t; int x, w; } wide[3] = { {"space", 6, 195}, {"delete", 207, 97}, {"GO", 310, 84} };
-	for (int i = 0; i < 3; i++) {
-		bool sel = keyRow == 4 && ((keyCol < 5 && i == 0) || (keyCol >= 5 && keyCol < 8 && i == 1) || (keyCol >= 8 && i == 2));
-		if (sel) pd->graphics->fillRect(wide[i].x, 188, wide[i].w, 23, kColorBlack); else pd->graphics->drawRect(wide[i].x, 188, wide[i].w, 23, kColorBlack);
-		Tc(fBold, wide[i].t, wide[i].x + wide[i].w / 2, 192, sel ? kDrawModeFillWhite : kDrawModeFillBlack);
-	}
-	footer("A type   B delete   crank moves");
+	header(search_title(), cnt);
+	int w = viewW - 24;
+	pd->graphics->drawRect(8, 34, viewW - 16, 74, kColorBlack);
+	pd->graphics->drawRect(9, 35, viewW - 18, 72, kColorBlack);
+	draw_typed(16, 42, w - 8, 3);
+	T(fBody, kbVisible ? "OK to search, B deletes" : "Opening keyboard...", 12, 120, kDrawModeFillBlack);
+	footer(!strcmp(textSource, "all") ? "then choose where to search" : "type, then OK");
 }
 
 static void draw_chat(void)
 {
-	header("AI chat - pollinations.ai", chatReq ? "thinking..." : "");
+	bool typing = kbActive && !strcmp(textSource, "chat");
+	char cnt[16]; snprintf(cnt, sizeof cnt, "%d/%d", textLen, textMax);
+	header("AI chat - pollinations.ai", typing ? cnt : chatReq ? "thinking..." : "");
+	/* the transcript re-wraps to whatever width the keyboard leaves */
+	chatWrapW = viewW - 28;
+	if (chatWrapW != chatWrapBuilt && (abs(chatWrapW - chatWrapBuilt) >= 6 || viewW == 400)) { chatDirty = true; chatWrapBuilt = chatWrapW; }
 	if (chatDirty) chat_rebuild();
-	int rows = 10, maxScroll = chatLineN > rows ? chatLineN - rows : 0;
+	int composeH = typing ? 44 : 0;
+	int rows = (216 - 28 - composeH) / 18, maxScroll = chatLineN > rows ? chatLineN - rows : 0;
+	if (typing) chatScroll = maxScroll;                                  /* keep the newest lines in view while typing */
 	if (chatScroll > maxScroll) chatScroll = maxScroll;
 	if (chatScroll < 0) chatScroll = 0;
 	for (int i = 0; i < rows; i++) {
@@ -999,11 +1020,15 @@ static void draw_chat(void)
 		char d[24]; snprintf(d, sizeof d, "thinking%.*s", (int)((now_ms() / 350) % 4), "...");
 		T(fBody, d, 8, 28 + (chatLineN - chatScroll < rows ? chatLineN - chatScroll : rows - 1) * 18, kDrawModeFillBlack);
 	}
-	if (maxScroll) {
+	if (maxScroll && !typing) {
 		int h = 180 * rows / chatLineN; if (h < 10) h = 10;
-		pd->graphics->fillRect(396, 28 + (180 - h) * chatScroll / maxScroll, 4, h, kColorBlack);
+		pd->graphics->fillRect(viewW - 4, 28 + (180 - h) * chatScroll / maxScroll, 4, h, kColorBlack);
 	}
-	footer("A write    crank / up-down scroll    B back");
+	if (typing) {                                                        /* input box rides at the bottom of the free area */
+		pd->graphics->drawRect(6, 216 - composeH + 2, viewW - 12, composeH - 4, kColorBlack);
+		draw_typed(12, 216 - composeH + 5, viewW - 28, 2);
+	}
+	footer(typing ? "OK sends, B deletes" : "A write    crank / up-down scroll    B back");
 }
 
 /* ---------- main loop ---------- */
@@ -1029,12 +1054,17 @@ static void list_input(List* l, PDButtons pushed)
 	if (l->sel > l->top + 7) l->top = l->sel - 7;
 }
 
-static int update(void* ud)
+/* One frame of the app. `left` = x of the system keyboard's left edge (400 when hidden); while it slides in the whole UI
+   re-lays itself out in the free width, so it follows the keyboard. */
+static void app_update(int left, bool keyboardOn)
 {
-	(void)ud;
 	PDButtons cur, pushed, released;
 	pd->system->getButtonState(&cur, &pushed, &released);
+	kbVisible = keyboardOn;
+	viewW = left < 160 ? 160 : left > 400 ? 400 : left;
+	if (keyboardOn) pushed = 0;                                   /* the keyboard owns the buttons (they still reach us as raw state) */
 	if (mode != M_VIDEO) pd->graphics->clear(kColorWhite);
+	if (viewW < 400) pd->graphics->setClipRect(0, 0, viewW, 240); else pd->graphics->clearClipRect();
 
 	if (!accessAsked) {
 		accessAsked = true;
@@ -1109,24 +1139,10 @@ static int update(void* ud)
 			if (pushed & (kButtonA | kButtonB)) mode = depth ? M_LIST : M_HOME;
 			break;
 		}
-		case M_TEXT: {
-			draw_keyboard();
-			float c = pd->system->getCrankChange(); crankAcc += c;
-			while (crankAcc > 22) { keyCol = (keyCol + 1) % 10; crankAcc -= 22; }
-			while (crankAcc < -22) { keyCol = (keyCol + 9) % 10; crankAcc += 22; }
-			if (pushed & kButtonRight) keyCol = (keyCol + 1) % 10;
-			if (pushed & kButtonLeft) keyCol = (keyCol + 9) % 10;
-			if (pushed & kButtonDown) keyRow = (keyRow + 1) % 5;
-			if (pushed & kButtonUp) keyRow = (keyRow + 4) % 5;
-			if (pushed & kButtonA) {
-				if (keyRow < 4) { if (textLen < textMax) textBuf[textLen++] = KEYS[keyRow][keyCol]; }
-				else if (keyCol < 5) { if (textLen < textMax) textBuf[textLen++] = ' '; }
-				else if (keyCol < 8) { if (textLen > 0) textLen--; }
-				else submit_text();
-			}
-			if (pushed & kButtonB) { if (textLen > 0) textLen--; else mode = !strcmp(textSource, "chat") ? M_CHAT : depth ? M_LIST : M_HOME; }
+		case M_TEXT:
+			draw_text_screen();
+			if (!kbActive && !kbWant) mode = depth ? M_LIST : M_HOME;     /* keyboard was cancelled */
 			break;
-		}
 		case M_CHAT: {
 			draw_chat();
 			float c = pd->system->getCrankChange(); crankAcc += c;
@@ -1134,8 +1150,8 @@ static int update(void* ud)
 			while (crankAcc < -20) { chatScroll--; crankAcc += 20; }
 			if (pushed & kButtonDown) chatScroll += 3;
 			if (pushed & kButtonUp) chatScroll -= 3;
-			if ((pushed & kButtonA) && !chatReq) open_text("chat", 110);
-			if (pushed & kButtonB) mode = depth ? M_LIST : M_HOME;
+			if ((pushed & kButtonA) && !chatReq && !kbActive) open_text("chat", 110);
+			if ((pushed & kButtonB) && !kbActive) mode = depth ? M_LIST : M_HOME;
 			break;
 		}
 		case M_VIDEO: {
@@ -1174,7 +1190,45 @@ static int update(void* ud)
 			break;
 		}
 	}
-	return 1;
+	if (viewW < 400) pd->graphics->clearClipRect();
+}
+
+/* ---------- Lua bridge: main.lua drives the loop and the system keyboard ---------- */
+
+static int l_update(lua_State* L)
+{
+	(void)L;
+	app_update(pd->lua->getArgInt(1), pd->lua->getArgBool(2));
+	return 0;
+}
+
+static int l_kbRequest(lua_State* L)                    /* -> text, caps  (or nil) */
+{
+	(void)L;
+	if (!kbWant) { pd->lua->pushNil(); return 1; }
+	kbWant = false;
+	pd->lua->pushString(textBuf);
+	pd->lua->pushInt(kbCaps);
+	return 2;
+}
+
+static int l_kbText(lua_State* L)
+{
+	(void)L;
+	const char* t = pd->lua->getArgString(1);
+	copy_ascii(textBuf, sizeof textBuf, t ? t : "");
+	textLen = (int)strlen(textBuf);
+	if (textLen > textMax) textLen = textMax;                    /* longer than the field allows: ignore the rest */
+	return 0;
+}
+
+static int l_kbDone(lua_State* L)                        /* keyboard closing: ok = the user chose OK */
+{
+	(void)L;
+	bool ok = pd->lua->getArgBool(1);
+	kbActive = false; kbWant = false;
+	if (ok) submit_text(); else if (mode == M_TEXT) mode = depth ? M_LIST : M_HOME;
+	return 0;
 }
 
 #ifdef _WINDLL
@@ -1194,7 +1248,13 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		if (!fBig) fBig = fBold;
 		load_settings();
 		pd->network->setEnabled(true, NULL);
-		pd->system->setUpdateCallback(update, NULL);
+		/* no update callback on purpose: that makes the system start Lua, and main.lua drives the frames */
+	} else if (event == kEventInitLua) {
+		const char* err;
+		if (!pd->lua->addFunction(l_update, "airwave.update", &err)) pd->system->logToConsole("addFunction update: %s", err);
+		if (!pd->lua->addFunction(l_kbRequest, "airwave.kbRequest", &err)) pd->system->logToConsole("addFunction kbRequest: %s", err);
+		if (!pd->lua->addFunction(l_kbText, "airwave.kbText", &err)) pd->system->logToConsole("addFunction kbText: %s", err);
+		if (!pd->lua->addFunction(l_kbDone, "airwave.kbDone", &err)) pd->system->logToConsole("addFunction kbDone: %s", err);
 	} else if (event == kEventTerminate) {
 		stop_playback();
 	}
