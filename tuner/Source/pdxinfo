@@ -1,0 +1,6 @@
+name=Tuner
+author=Zakariya
+description=Internet radio, Apple Podcasts, BBC radio and IPTV audio
+bundleID=com.zakariya.tuner
+version=1.0
+buildNumber=1

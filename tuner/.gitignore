@@ -1,0 +1,5 @@
+build/
+build_dev/
+Source/pdex.*
+*.pdx/
+tuner_DEVICE.pdx/
