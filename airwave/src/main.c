@@ -200,11 +200,23 @@ static void open_menu(const char* id)
 		}
 	} else if (!strcmp(id, "tv")) {
 		l = list_new("TV & Shows");
-		list_add(l, "Nat Geo Wild & more shows", K_RELAY_LIST, "/tv/shows");
-		list_add(l, "Free live TV & news", K_RELAY_LIST, "/tv/free");
+		list_add(l, "Live TV channels (Pluto TV)", K_RELAY_LIST, "/pluto/categories");
+		list_add(l, "Nat Geo Wild & shows (YouTube)", K_RELAY_LIST, "/tv/shows");
+		list_add(l, "YouTube Shorts", K_MENU, "shorts");
+		list_add(l, "Free live news", K_RELAY_LIST, "/tv/free");
 		list_add(l, "My IPTV channels", K_MENU, "iptv");
 		list_add(l, "Internet Archive (classic TV...)", K_MENU, "archive");
 		list_add(l, "Search YouTube...", K_SEARCH, "yt");
+		list_add(l, "Search live channels...", K_SEARCH, "pluto");
+	} else if (!strcmp(id, "shorts")) {
+		l = list_new("YouTube Shorts");
+		list_add(l, "Funny", K_RELAY_LIST, "/yt/shorts?q=funny");
+		list_add(l, "Funny animals", K_RELAY_LIST, "/yt/shorts?q=funnyanimals");
+		list_add(l, "Cats", K_RELAY_LIST, "/yt/shorts?q=cats");
+		list_add(l, "Fails", K_RELAY_LIST, "/yt/shorts?q=fails");
+		list_add(l, "Wildlife", K_RELAY_LIST, "/yt/shorts?q=wildlife");
+		list_add(l, "Nat Geo", K_RELAY_LIST, "/yt/shorts?q=%40NatGeo");
+		list_add(l, "Search shorts...", K_SEARCH, "shorts");
 	} else if (!strcmp(id, "iptv")) {
 		l = list_new("My IPTV");
 		list_add(l, "Search channels...", K_SEARCH, "iptv");
@@ -383,6 +395,9 @@ static void stop_playback(void)
 }
 
 static char playTitle[80], playArg[1100];
+static List* playList;                 /* the list the current item came from: Up/Down in the player = next/previous */
+static uint32_t overlayUntil;          /* channel-name banner; armed when the first picture appears */
+static bool overlayDrawn, overlayArmed;
 static bool triedRelay;
 
 static void start_playback(const char* title, const char* arg, bool video)
@@ -408,6 +423,7 @@ static void start_playback(const char* title, const char* arg, bool video)
 	pd->sound->fileplayer->setStopOnUnderrun(player, 0);
 	pd->sound->fileplayer->setMP3StreamSource(player, data_source, src, 2.0f);
 	mode = video ? M_VIDEO : M_PLAY;
+	overlayUntil = 0; overlayDrawn = false; overlayArmed = false;
 }
 
 /* "/iptv/video/7" -> "/iptv/audio/7" (every relay source has both) */
@@ -492,9 +508,17 @@ static void video_show(uint32_t now)
 		vqHead = (vqHead + 1) % VQ_MAX; vqCount--;
 		changed = vGotFrame = true;
 	}
-	if (changed) {
+	if (vGotFrame && !overlayArmed) { overlayArmed = true; overlayUntil = now + 3500; }
+	bool overlay = vGotFrame && now < overlayUntil;
+	if (changed || overlay || overlayDrawn) {
 		memcpy(pd->graphics->getFrame(), frameBuf, FRAME_BYTES);
-		pd->graphics->markUpdatedRows(0, 239);
+		if (overlay) {                                           /* channel name for a few seconds after tuning in */
+			pd->graphics->fillRect(0, 0, 400, 22, kColorBlack);
+			T(fBold, nowTitle, 6, 3, kDrawModeFillWhite);
+			if (playList) T(fBody, "Up/Down: next", 394 - TW(fBody, "Up/Down: next"), 3, kDrawModeFillWhite);
+		}
+		overlayDrawn = overlay;
+		pd->graphics->markUpdatedRows(0, (changed || !overlay) ? 239 : 24);
 	}
 }
 
@@ -664,7 +688,8 @@ static void run_search(const char* source, const char* query)
 	} else {
 		if (!relayHost[0]) { need_relay(); return; }
 		const char* route = !strcmp(source, "tunein") ? "/tunein/search?q=%s" : !strcmp(source, "yt") ? "/yt/search?q=%s" :
-			!strcmp(source, "ia") ? "/ia/search?q=%s" : "/iptv/channels?q=%s";
+			!strcmp(source, "ia") ? "/ia/search?q=%s" : !strcmp(source, "pluto") ? "/pluto/channels?q=%s" :
+			!strcmp(source, "shorts") ? "/yt/shorts?q=%s" : "/iptv/channels?q=%s";
 		snprintf(path, sizeof path, route, enc);
 		relay_url(url, sizeof url, path);
 		start_fetch(url, 64 * 1024, parse_relay_list, query);
@@ -695,13 +720,33 @@ static void activate(Item* it, bool altAction)
 			relay_url(url, sizeof url, it->arg);
 			start_fetch(url, 96 * 1024, parse_relay_list, title); break;
 		}
-		case K_PLAY: triedRelay = false; start_playback(it->label, it->arg, false); break;
+		case K_PLAY: triedRelay = false; playList = depth ? stack[depth - 1] : NULL; start_playback(it->label, it->arg, false); break;
 		case K_PLAY_VIDEO:
 			triedRelay = true; videoFellBack = altAction;                 /* Right button = audio only */
+			playList = depth ? stack[depth - 1] : NULL;
 			if (altAction) { static char a[1100]; audio_arg(it->arg, a, sizeof a); start_playback(it->label, a, false); }
 			else start_playback(it->label, it->arg, true);
 			break;
 		default: break;
+	}
+}
+
+/* channel surfing: Up/Down in the player moves through the list the item came from */
+static void surf(int dir)
+{
+	List* l = playList;
+	if (!l) return;
+	bool stillThere = false;
+	for (int i = 0; i < depth; i++) if (stack[i] == l) stillThere = true;
+	if (!stillThere) return;
+	Kind want = l->items[l->sel].kind;
+	for (int i = l->sel + dir; i >= 0 && i < l->n; i += dir) {
+		if (l->items[i].kind != want) continue;
+		l->sel = i;
+		if (l->sel < l->top) l->top = l->sel;
+		if (l->sel > l->top + 7) l->top = l->sel - 7;
+		activate(&l->items[i], false);
+		return;
 	}
 }
 
@@ -716,7 +761,9 @@ static void submit_text(void)
 	List* l = list_new(title);
 	list_add(l, "Radio stations", K_SEARCH_IN, "radio");
 	list_add(l, "Podcasts", K_SEARCH_IN, "pod");
-	list_add(l, "YouTube (Nat Geo, BBC Earth...)", K_SEARCH_IN, "yt");
+	list_add(l, "Live TV channels", K_SEARCH_IN, "pluto");
+	list_add(l, "YouTube videos", K_SEARCH_IN, "yt");
+	list_add(l, "YouTube Shorts", K_SEARCH_IN, "shorts");
 	list_add(l, "Internet Archive", K_SEARCH_IN, "ia");
 	list_add(l, "TuneIn", K_SEARCH_IN, "tunein");
 	list_add(l, "My IPTV channels", K_SEARCH_IN, "iptv");
@@ -892,15 +939,16 @@ static void draw_play(void)
 		char kb[32]; snprintf(kb, sizeof kb, "%u KB", (unsigned)stream->total / 1024);
 		T(fBody, kb, 392 - TW(fBody, kb), 176, kDrawModeFillBlack);
 	}
-	footer("B stop & back");
+	footer(playList ? "Up/Down next    B stop & back" : "B stop & back");
 }
 
 static void draw_keyboard(void)
 {
 	const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"iptv","Search my IPTV"},
-		{"yt","Search YouTube"}, {"ia","Search Internet Archive"}, {"all","Search everything"}, {"chat","Message the AI"} };
+		{"yt","Search YouTube"}, {"ia","Search Internet Archive"}, {"all","Search everything"}, {"chat","Message the AI"},
+		{"pluto","Search live channels"}, {"shorts","Search Shorts (one word / #tag)"} };
 	const char* title = "Search";
-	for (int i = 0; i < 8; i++) if (!strcmp(titles[i][0], textSource)) title = titles[i][1];
+	for (int i = 0; i < 10; i++) if (!strcmp(titles[i][0], textSource)) title = titles[i][1];
 	char cnt[16]; snprintf(cnt, sizeof cnt, "%d/%d", textLen, textMax);
 	header(title, cnt);
 	/* text field (last ~2 lines) */
@@ -1104,11 +1152,15 @@ static int update(void* ud)
 				T(fBold, dead ? "Can't play this one" : "Loading video...", 12, 100, kDrawModeFillWhite);
 				if (dead) { T(fBody, !strcmp(stream->error, "HTTP 502") ? "The relay couldn't open it (YouTube needs yt-dlp, see README)" : stream->error[0] ? stream->error : "stream ended", 12, 124, kDrawModeFillWhite); T(fBody, nowTitle, 12, 146, kDrawModeFillWhite); }
 			}
+			if (pushed & kButtonDown) surf(1);
+			if (pushed & kButtonUp) surf(-1);
 			if (pushed & kButtonB) { stop_playback(); mode = depth ? M_LIST : M_HOME; }
 			break;
 		}
 		case M_PLAY:
 			draw_play();
+			if (pushed & kButtonDown) surf(1);
+			if (pushed & kButtonUp) surf(-1);
 			if (pushed & kButtonB) { stop_playback(); mode = depth ? M_LIST : M_HOME; }
 			break;
 		case M_LIST: {

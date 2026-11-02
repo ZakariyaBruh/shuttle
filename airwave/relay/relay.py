@@ -11,7 +11,7 @@ expose it on a network you trust. To reach it from anywhere with no account or k
 and ALWAYS start the relay with --token SECRET when it is reachable from the internet (put the same "relay_token" in settings.json).
 
 Lists are JSON arrays of {"name", "path", "video"?, "kind"?}; "kind":"list" opens another list. Video paths return the stream
-format described under VIDEO below. Sources: your IPTV playlist(s), a few free live channels, official YouTube channels and
+format described under VIDEO below. Sources: your IPTV playlist(s), Pluto TV (real free live channels), a few free news streams, official YouTube channels and
 search (yt-dlp), the Internet Archive, TuneIn, BBC, radio-browser transcodes, and a generic /t.mp3 transcoder.
 """
 import argparse
@@ -23,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections import deque
 
 try:
@@ -196,6 +197,80 @@ def free_list(prefix, rows):
     return [{"name": n, "path": f"/{prefix}/audio/{i}", "video": f"/{prefix}/video/{i}"} for i, (n, _) in enumerate(rows)]
 
 
+def pluto_channels():
+    def load():
+        data = json.loads(fetch("https://api.pluto.tv/v2/channels", 60))
+        return sorted((c for c in data if c.get("isStitched") and c.get("category") != "Testing"), key=lambda c: (c.get("category", ""), c.get("number", 0)))
+    return _cached(("pluto",), load, 3600)
+
+
+def pluto_url(slug):
+    """Pluto TV's own free live stream for a channel (ad-supported, US lineup unless your IP says otherwise)."""
+    for c in pluto_channels():
+        if c["slug"] == slug:
+            u = c["stitched"]["urls"][0]["url"]
+            p = urllib.parse.urlparse(u)
+            q = dict(urllib.parse.parse_qsl(p.query, keep_blank_values=True))
+            q.update(deviceId=str(uuid.uuid4()), sid=str(uuid.uuid4()), appName="web", appVersion="9.0.0", deviceType="web",
+                     deviceMake="chrome", deviceModel="web", clientTime="0")
+            return p._replace(query=urllib.parse.urlencode(q)).geturl()
+    raise ValueError("unknown Pluto channel")
+
+
+def paged(rows, off, params, base, per=39):
+    """rows: list of item dicts. Adds a 'More...' entry that re-requests `base` with the next offset."""
+    page = rows[off:off + per]
+    if off + per < len(rows):
+        more = dict(params)
+        more["offset"] = off + per
+        page.append({"name": f"More... ({len(rows) - off - per} left)", "path": base + "?" + urllib.parse.urlencode(more), "kind": "list"})
+    return page
+
+
+def yt_shorts(query):
+    """Real Shorts: a hashtag's Shorts tab (e.g. 'funny animals' -> #funnyanimals) or a channel's (@NatGeo)."""
+    if re.fullmatch(r"@[\w.\-]+", query):
+        target = f"https://www.youtube.com/{query}/shorts"
+    else:
+        tag = re.sub(r"[^a-z0-9]", "", query.lower())
+        if not tag:
+            raise ValueError("empty search")
+        target = f"https://www.youtube.com/hashtag/{tag}/shorts"
+    out = []
+    for line in ytdlp(["--flat-playlist", "--playlist-end", "40", "-j", target]).splitlines():
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        vid = d.get("id", "")
+        if re.fullmatch(r"[\w-]{11}", vid) and "/shorts/" in d.get("url", ""):
+            out.append({"name": (d.get("title") or "Short")[:90], "path": f"/yt/audio/{vid}", "video": f"/yt/video/{vid}"})
+    return out
+
+
+def low_variant(src):
+    """HLS master playlist -> its smallest variant. A 400x240 1-bit screen doesn't need the 1080p rendition (and a Wi-Fi
+    relay or slow link often can't keep up with it)."""
+    if ".m3u8" not in src.split("?")[0] or not src.startswith("http"):
+        return src
+
+    def pick():
+        try:
+            text = fetch(src, 10)
+        except Exception:
+            return src
+        best = None
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF") and i + 1 < len(lines):
+                m = re.search(r"BANDWIDTH=(\d+)", line)
+                bw = int(m[1]) if m else 1 << 60
+                if best is None or bw < best[0]:
+                    best = (bw, lines[i + 1].strip())
+        return urllib.parse.urljoin(src, best[1]) if best and best[1] else src
+    return _cached(("lowvar", src), pick, 120)
+
+
 def net_input_opts(src, reconnect=True):
     """HTTP-only input options (a local file in the M3U would reject them)."""
     if not src.startswith("http"):
@@ -257,16 +332,19 @@ def _thresholds():
     return (52.9829189 * ((0.06711056 * x + 0.00583715 * y) % 1.0)) % 1.0
 
 
-def video_filter():
-    pre = (f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,format=gray,"
+def video_filter(fit="contain"):
+    # contain = whole picture with bars (default); cover = fill the screen, cropping the edges
+    scale = (f"scale={W}:{H}:force_original_aspect_ratio=increase:flags=lanczos,crop={W}:{H}" if fit == "cover" else
+             f"scale={W}:{H}:force_original_aspect_ratio=decrease:flags=lanczos,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2")
+    pre = (f"{scale},format=gray,"
            # stable auto-contrast (smoothed over time), light denoise (less flicker), then sharpen so detail survives 1 bit
            "normalize=blackpt=black:whitept=white:smoothing=15,hqdn3d=1.5:1.5:5:5,unsharp=5:5:1.0:5:5:0.0,eq=gamma=1.05")
     return pre
 
 
-def video_cmd(src, audio_fd):
+def video_cmd(src, audio_fd, fit="contain"):
     fmt = ["-pix_fmt", "gray", "-f", "rawvideo"] if np is not None else ["-sws_dither", "bayer", "-pix_fmt", "monob", "-f", "rawvideo"]
-    vf = video_filter() if np is not None else f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,format=gray,eq=gamma=1.35:contrast=1.15"
+    vf = video_filter(fit) if np is not None else f"scale={W}:{H}:force_original_aspect_ratio=decrease,pad={W}:{H}:(ow-iw)/2:(oh-ih)/2,format=gray,eq=gamma=1.35:contrast=1.15"
     return ["ffmpeg", "-hide_banner", "-loglevel", "error", "-re", *net_input_opts(src, reconnect=False), "-i", src,
             "-map", "0:v:0", "-vf", vf, "-r", str(FPS), *fmt, "pipe:1",
             "-map", "0:a:0?", "-ac", "1", "-ar", "44100", "-b:a", "48k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", f"pipe:{audio_fd}"]
@@ -289,10 +367,10 @@ def to_lcd_rows(raw):
 _TH = _thresholds() if np is not None else None
 
 
-def video_packets(src):
+def video_packets(src, fit="contain"):
     """Generator of byte chunks in the stream format described above."""
     r_fd, w_fd = os.pipe()
-    proc = subprocess.Popen(video_cmd(src, w_fd), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=(w_fd,))
+    proc = subprocess.Popen(video_cmd(src, w_fd, fit), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=(w_fd,))
     os.close(w_fd)
     audio = deque()
     lock = threading.Lock()
@@ -367,12 +445,12 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             proc.kill()
 
-    def stream_video(self, src):
+    def stream_video(self, src, fit="contain"):
         try:
             self.send_response(200)
             self.send_header("Content-Type", "application/x-tuner-video")
             self.end_headers()
-            for chunk in video_packets(src):
+            for chunk in video_packets(src, fit):
                 self.wfile.write(chunk)
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -406,10 +484,13 @@ class Handler(BaseHTTPRequestHandler):
                     more["offset"] = off + 39
                     page.append({"name": f"More... ({len(rows) - off - 39} left)", "path": "/iptv/channels?" + urllib.parse.urlencode(more), "kind": "list"})
                 return self.send_json(page)
-            m = re.fullmatch(r"/(iptv|free|yt|ia)/(audio|video)/([\w.\-]+?)(?:\.mp3)?", u.path)
+            m = re.fullmatch(r"/(iptv|free|yt|ia|pluto)/(audio|video)/([\w.\-]+?)(?:\.mp3)?", u.path)
             if m:
                 kind, mode, ident = m.groups()
-                if kind == "iptv":
+                fit = "cover" if q.get("fit", [""])[0] == "cover" else "contain"
+                if kind == "pluto":
+                    src = pluto_url(ident)
+                elif kind == "iptv":
                     src = CHANNELS[int(ident)][1]
                 elif kind == "free":
                     src = FREE_LIVE[int(ident)][1]
@@ -417,9 +498,24 @@ class Handler(BaseHTTPRequestHandler):
                     src = yt_media_url(ident)
                 else:
                     src = ia_media_url(ident)
-                return self.stream(src) if mode == "audio" else self.stream_video(src)
+                src = low_variant(src)
+                return self.stream(src) if mode == "audio" else self.stream_video(src, fit)
             if u.path == "/tv/shows":
                 return self.send_json([{"name": n, "path": "/yt/channel?c=" + urllib.parse.quote(url, safe=""), "kind": "list"} for n, url in SHOWS])
+            if u.path == "/pluto/categories":
+                counts = {}
+                for c in pluto_channels():
+                    counts[c["category"]] = counts.get(c["category"], 0) + 1
+                top = [{"name": f"{k} ({v})", "path": "/pluto/channels?cat=" + urllib.parse.quote(k), "kind": "list"} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
+                return self.send_json(top[:40])
+            if u.path == "/pluto/channels":
+                cat, term, off = q.get("cat", [None])[0], q.get("q", [""])[0].lower(), int(q.get("offset", ["0"])[0])
+                rows = [{"name": c["name"], "path": f"/pluto/audio/{c['slug']}", "video": f"/pluto/video/{c['slug']}"}
+                        for c in pluto_channels() if term in c["name"].lower() and (cat is None or c["category"] == cat)]
+                params = {k: v[0] for k, v in q.items() if k not in ("offset", "k")}
+                return self.send_json(paged(rows, off, params, "/pluto/channels"))
+            if u.path == "/yt/shorts":
+                return self.send_json(_cached(("shorts", q["q"][0]), lambda: yt_shorts(q["q"][0]), 600))
             if u.path == "/tv/free":
                 return self.send_json(free_list("free", FREE_LIVE))
             if u.path == "/yt/channel":

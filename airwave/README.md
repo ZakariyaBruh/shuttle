@@ -9,21 +9,30 @@ network (`fileplayer->setMP3StreamSource`) and draws dithered video straight int
 | Radio | [radio-browser.info](https://www.radio-browser.info): top, genres, countries, search | only for non-MP3 stations (marked `*`) |
 | Podcasts | Apple top charts + iTunes search; episodes from the show's RSS feed | only for AAC/M4A episodes and some tracking redirects |
 | BBC | Radio 1 to 6 Music, 4 Extra, World Service, nations | yes |
-| TV | **Nat Geo Wild** and other official shows (YouTube), free live news/TV, Internet Archive classic TV, your own IPTV list, YouTube search | yes |
+| TV | **real live channels (Pluto TV, ~450 free channels)**, Nat Geo Wild & other official shows (YouTube), **YouTube Shorts**, free live news, Internet Archive classic TV, your own IPTV list, YouTube search | yes |
 | TuneIn | trending + search | yes |
 | AI Chat | [pollinations.ai](https://pollinations.ai) text API, no key; remembers the last few turns | no |
 | Setup | shows Wi-Fi and relay status | |
 
-### About Nat Geo Wild
-The Nat Geo Wild *TV channel* is pay-TV only, so there is no legal free stream of it. Its official YouTube channel (now called
-**Nat Geo Animals**) posts full episodes for free, and that is what the "Nat Geo Wild & more shows" list opens, alongside National
-Geographic, BBC Earth, DW Documentary, Smithsonian Channel and NASA. The Internet Archive adds public-domain classic TV, cartoons,
-NASA and vintage films. For more live channels point the relay at any M3U (`--m3u https://iptv-org.github.io/iptv/categories/documentary.m3u`).
+### About the Nat Geo Wild channel
+The Nat Geo Wild *TV channel* is pay-TV only (Disney), and I found no legal free live stream of it: I checked Pluto TV's whole
+lineup (467 channels) and it isn't there. What you get instead:
+- **Live TV channels (Pluto TV)**: real 24/7 channels such as BBC Earth, PBS Nature, Love Nature, Naturescape, Dinos 24/7, plus news, movies,
+  classic TV, kids, sport... searchable by name or browsable by category. Pluto's licensing is regional: if you see a "where to watch" card
+  the channel isn't available in your country (that is what I got from my environment, so I could not verify real Pluto *content*).
+- **Nat Geo Wild & shows (YouTube)**: the official Nat Geo Wild channel is now called **Nat Geo Animals** and posts full episodes for free;
+  also National Geographic, BBC Earth, DW Documentary, Smithsonian Channel and NASA.
+- If you have a TV subscription, the channel is in the Nat Geo app / Disney+ (they need your login, which a Playdate can't do).
+
+### Channel surfing and Shorts
+In any video or station list, press **Up/Down while watching** to jump to the previous/next channel, short or station, TikTok style.
+**YouTube Shorts** (Funny, Funny animals, Cats, Fails, Wildlife, Nat Geo, or search a word/#tag) come from the hashtag/channel Shorts pages.
+Shorts are vertical, so they are shown whole with side bars; the relay also supports `?fit=cover` (fill the screen, cropping the edges).
 
 ## Why a relay?
 The Playdate can only decode MP3, has no HLS/AAC support, and its 1-bit screen needs video converted first. `relay/relay.py` is a
 small Python + ffmpeg server that
-- turns streams into 64 kbps mono MP3 and follows tracking redirects,
+- turns streams into 64 kbps mono MP3 and follows tracking redirects; for HLS it picks the *smallest* variant (a 400x240 1-bit screen doesn't need 1080p),
 - **dithers video to 1 bit**: 400x240, 15 fps, ordered dithering with interleaved-gradient noise (crisper than Bayer, no visible grid,
   and a *static* pattern so still areas stay still and frame deltas stay tiny), after stabilised auto-contrast, light denoise and
   sharpening; sends XOR-delta + PackBits frames with 48 kbps audio (about 20-80 KB/s),
@@ -76,10 +85,10 @@ Needs `gcc-arm-none-eabi` for the device build.
 
 ## Status / known limits
 - Tested in the Playdate Simulator 3.1.2: home grid, radio, podcasts (incl. redirect fallback), BBC, TuneIn, search, keyboard, AI chat,
-  dithered video with audio from your IPTV list, free live news (DW), Internet Archive, and the relay token. **Not tested on real
+  dithered video with audio from your IPTV list, free live news (DW, Al Jazeera) with channel surfing, Internet Archive, the Pluto TV lists, and the relay token. **Not tested on real
   hardware** (the ARM build links and packages; Wi-Fi behaviour and memory use on the device are unverified).
-- **YouTube playback could not be verified**: from my environment YouTube blocks yt-dlp with a bot check, so I only verified the
-  channel/search *listings* (Nat Geo Animals episodes list correctly). On a normal home connection it usually works; if not, see above.
+- **YouTube playback (videos and Shorts) could not be verified**: from my environment YouTube blocks yt-dlp with a bot check, so I only verified the
+  channel/hashtag/search *listings* (Nat Geo Animals episodes and funny Shorts list correctly). On a normal home connection it usually works; if not, see above.
 - Pollinations' anonymous tier is rate-limited and its model/output can change; replies drop emoji (the font is Latin-only).
 - 1-bit video is rough on fast action; audio/video sync is approximate (fixed 1.5 s offset).
 - Streams are MP3 only (the Playdate's decoder); many stations and podcast hosts only publish AAC, hence the relay.
