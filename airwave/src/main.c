@@ -186,12 +186,12 @@ static void via_relay(char* out, size_t sz, const char* url)
 bool item_locked(const Item* it)
 {
 	if (relayHost[0]) return false;
-	static const char* relayMenus[] = { "tv", "yt", "shorts", "iptv", "archive", "bbc" };
+	static const char* relayMenus[] = { "tv", "yt", "shorts", "iptv", "archive", "bbc", "pluto" };
 	static const char* relaySearch[] = { "iptv", "yt", "ia", "pluto", "shorts" };
 	switch (it->kind) {
 		case K_RELAY_LIST: case K_PLAY_VIDEO: return true;
 		case K_PLAY: return !strncmp(it->arg, "relay:", 6);
-		case K_MENU: for (int i = 0; i < 6; i++) if (!strcmp(it->arg, relayMenus[i])) return true; return false;
+		case K_MENU: for (int i = 0; i < 7; i++) if (!strcmp(it->arg, relayMenus[i])) return true; return false;
 		case K_SEARCH: case K_SEARCH_IN: for (int i = 0; i < 5; i++) if (!strcmp(it->arg, relaySearch[i])) return true; return false;
 		default: return false;
 	}
@@ -211,7 +211,7 @@ IconId item_icon(const Item* it)
 		case K_INFO: return IC_INFO;
 		case K_MENU:
 			if (!strcmp(it->arg, "yt") || !strcmp(it->arg, "shorts")) return IC_YT;
-			if (!strcmp(it->arg, "tv") || !strcmp(it->arg, "iptv") || !strcmp(it->arg, "archive")) return IC_TV;
+			if (!strcmp(it->arg, "tv") || !strcmp(it->arg, "pluto") || !strcmp(it->arg, "iptv") || !strcmp(it->arg, "archive")) return IC_TV;
 			if (!strcmp(it->arg, "bbc") || !strcmp(it->arg, "radio")) return IC_RADIO;
 			if (!strcmp(it->arg, "podgenres")) return IC_POD;
 			return IC_LIST;
@@ -316,11 +316,16 @@ static void open_menu(const char* id)
 		}
 	} else if (!strcmp(id, "tv")) {
 		l = list_new("TV");
-		list_add2(l, "Live channels", "Pluto TV: news, movies, nature...", K_RELAY_LIST, "/pluto/categories");
+		list_add2(l, "Pluto TV", "Free live channels", K_MENU, "pluto");
 		list_add2(l, "Free live news", "DW, Al Jazeera, Red Bull TV", K_RELAY_LIST, "/tv/free");
 		list_add2(l, "Classic TV and films", "Internet Archive", K_MENU, "archive");
 		list_add2(l, "My IPTV playlist", "Your own channels", K_MENU, "iptv");
-		list_add2(l, "Search live channels", "By channel name", K_SEARCH, "pluto");
+	} else if (!strcmp(id, "pluto")) {
+		l = list_new("Pluto TV");
+		list_add2(l, "Pluto Movies", "Movie channels, Westerns, Sci-Fi", K_RELAY_LIST, "/pluto/movies");
+		list_add2(l, "News", "Live news channels", K_RELAY_LIST, "/pluto/channels?cat=News%20%2B%20Opinion");
+		list_add2(l, "All categories", "Browse every genre", K_RELAY_LIST, "/pluto/categories");
+		list_add2(l, "Search Pluto", "By channel name", K_SEARCH, "pluto");
 	} else if (!strcmp(id, "yt")) {
 		l = list_new("YouTube");
 		list_add2(l, "Documentary channels", "Full episodes: Nat Geo, BBC Earth...", K_RELAY_LIST, "/tv/shows");

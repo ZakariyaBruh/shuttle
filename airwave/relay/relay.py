@@ -518,6 +518,10 @@ class Handler(BaseHTTPRequestHandler):
                     counts[c["category"]] = counts.get(c["category"], 0) + 1
                 top = [{"name": f"{k} ({v})", "path": "/pluto/channels?cat=" + urllib.parse.quote(k), "kind": "list"} for k, v in sorted(counts.items(), key=lambda kv: -kv[1])]
                 return self.send_json(top[:40])
+            if u.path == "/pluto/movies":
+                rows = [{"name": c["name"], "sub": c.get("category", "Movies"), "path": f"/pluto/audio/{c['slug']}", "video": f"/pluto/video/{c['slug']}"}
+                        for c in pluto_channels() if c.get("category") in ("Movies", "Westerns", "Sci-Fi") or re.search(r"movie|cinema|film", c["name"], re.I)]
+                return self.send_json(paged(rows, int(q.get("offset", ["0"])[0]), {k: v[0] for k, v in q.items() if k not in ("offset", "k")}, "/pluto/movies"))
             if u.path == "/pluto/channels":
                 cat, term, off = q.get("cat", [None])[0], q.get("q", [""])[0].lower(), int(q.get("offset", ["0"])[0])
                 rows = [{"name": c["name"], "sub": c.get("category", "Live"), "path": f"/pluto/audio/{c['slug']}", "video": f"/pluto/video/{c['slug']}"}

@@ -82,10 +82,14 @@ function inputOpts(src) { return /^https?:/.test(src) ? ["-user_agent", UA, "-re
 
 function streamMp3(src, res) {
   const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", ...inputOpts(src), "-i", src, "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "64k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:1"], { stdio: ["ignore", "pipe", "ignore"] });
-  res.writeHead(200, { "content-type": "audio/mpeg", "cache-control": "no-store" });
-  p.stdout.pipe(res);
+  let started = false;
+  p.stdout.on("data", (b) => {
+    if (!started) { started = true; res.writeHead(200, { "content-type": "audio/mpeg", "cache-control": "no-store" }); }
+    res.write(b);
+  });
   const stop = () => p.kill("SIGKILL");
-  res.on("close", stop); p.on("close", () => res.end());
+  res.on("close", stop);
+  p.on("close", () => { if (!started) json(res, 502, { error: "the source did not deliver audio" }); else res.end(); });
 }
 
 // interleaved-gradient-noise thresholds: a static pattern, so still areas stay still and deltas stay small
@@ -116,7 +120,8 @@ function streamVideo(src, res, fit) {
     "-map", "0:v:0", "-vf", vf, "-r", String(FPS), "-pix_fmt", "gray", "-f", "rawvideo", "pipe:1",
     "-map", "0:a:0?", "-ac", "1", "-ar", "44100", "-b:a", "48k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:3"];
   const p = spawn(FFMPEG, args, { stdio: ["ignore", "pipe", "ignore", "pipe"] });
-  res.writeHead(200, { "content-type": "application/x-airwave-video", "cache-control": "no-store" });
+  let started = false;
+  const begin = () => { if (!started) { started = true; res.writeHead(200, { "content-type": "application/x-airwave-video", "cache-control": "no-store" }); } };
   let audio = [];
   p.stdio[3].on("data", (b) => { for (let o = 0; o < b.length; o += 1024) audio.push(b.subarray(o, Math.min(o + 1024, b.length))); });
   let buf = Buffer.alloc(0), prev = Buffer.alloc(STRIDE * H), n = 0;
@@ -124,6 +129,7 @@ function streamVideo(src, res, fit) {
   p.stdout.on("data", (chunk) => {
     buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
     while (buf.length >= size) {
+      begin();
       const gray = buf.subarray(0, size); buf = buf.subarray(size);
       for (const a of audio) { const h = Buffer.alloc(3); h[0] = 1; h.writeUInt16LE(a.length, 1); res.write(h); res.write(a); }
       audio = [];
@@ -140,7 +146,8 @@ function streamVideo(src, res, fit) {
     }
   });
   const stop = () => p.kill("SIGKILL");
-  res.on("close", stop); p.on("close", () => res.end());
+  res.on("close", stop);
+  p.on("close", () => { if (!started) json(res, 502, { error: "the source did not deliver video" }); else res.end(); });
 }
 
 // ---------- AI chat through the Vercel AI Gateway (key stays on the server) ----------
@@ -187,6 +194,11 @@ module.exports = async (req, res) => {
     if (p === "/pluto/categories") {
       const counts = {}; for (const c of await plutoChannels()) counts[c.category] = (counts[c.category] || 0) + 1;
       return json(res, 200, Object.entries(counts).sort((a, b) => b[1] - a[1]).slice(0, 40).map(([k, v]) => ({ name: `${k} (${v})`, path: "/pluto/channels?cat=" + encodeURIComponent(k), kind: "list" })));
+    }
+    if (p === "/pluto/movies") {
+      const off = Number(q.get("offset") || 0);
+      const rows = (await plutoChannels()).filter((c) => ["Movies", "Westerns", "Sci-Fi"].includes(c.category) || /movie|cinema|film/i.test(c.name)).map((c) => ({ name: c.name, sub: c.category, path: `/pluto/audio/${c.slug}`, video: `/pluto/video/${c.slug}` }));
+      return json(res, 200, page(rows, off, {}, "/pluto/movies"));
     }
     if (p === "/pluto/channels") {
       const cat = q.get("cat"), term = (q.get("q") || "").toLowerCase(), off = Number(q.get("offset") || 0);
