@@ -45,6 +45,15 @@ rendition. `/health` reports what the relay can do (video / YouTube). `--token` 
 YouTube needs yt-dlp plus node or deno, and sometimes `--yt-cookies` (YouTube blocks data-centre IPs with a bot check; I could verify
 listings from my environment but **not YouTube playback**).
 
+### Vercel relay (v2.5)
+`vercel/` is the same relay as one Vercel Function (Node + `ffmpeg-static`): deploy the folder, set `AIRWAVE_TOKEN` (and optionally
+`AI_GATEWAY_API_KEY` for AI chat), then enter `https://<project>.vercel.app` and the token in Setup. Verified live: audio, Pluto TV
+and free news channels, 1-bit video. YouTube does not work there (YouTube blocks cloud IPs). Hobby plan requests last at most 300 s;
+the app re-requests live streams automatically. Without a gateway key, chat falls back to the free Pollinations service.
+
+### Stream queue (v2.5)
+Starting a stream stops the old one, frees its buffers and waits ~320 ms; skipping quickly (Left/Right/Up/Down) collapses into one request.
+
 ## Install
 Sideload `dist/Airwave.pdx.zip` at play.date/account/sideload (it has the device binary `pdex.bin` and the simulator library `pdex.so`). Allow internet access on first launch.
 
