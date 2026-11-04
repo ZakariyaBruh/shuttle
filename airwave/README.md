@@ -47,7 +47,7 @@ listings from my environment but **not YouTube playback**).
 
 ### Vercel relay (v2.5)
 `vercel/` is the same relay as one Vercel Function (Node + `ffmpeg-static`): deploy the folder, set `AIRWAVE_TOKEN` (and optionally
-`AI_GATEWAY_API_KEY` for AI chat), then enter `https://<project>.vercel.app` and the token in Setup. Verified live: audio, Pluto TV
+`AI_GATEWAY_API_KEY` for AI chat), then enter `https://<project>.vercel.app` and the token in Setup (this personal build has them baked in via `src/defaults.h`; Setup overrides). Verified live: audio, Pluto TV
 and free news channels, 1-bit video. YouTube does not work there (YouTube blocks cloud IPs). Hobby plan requests last at most 300 s;
 the app re-requests live streams automatically. Without a gateway key, chat falls back to the free Pollinations service.
 
