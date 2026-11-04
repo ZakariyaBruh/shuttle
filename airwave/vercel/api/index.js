@@ -128,7 +128,8 @@ async function lowVariant(src) {
 function inputOpts(src) { return /^https?:/.test(src) ? ["-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
 
 function streamMp3(src, res) {
-  const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", ...inputOpts(src), "-i", src, "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "64k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:1"], { stdio: ["ignore", "pipe", "ignore"] });
+  const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", ...inputOpts(src), "-i", src, "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "64k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:1"], { stdio: ["ignore", "pipe", "pipe"] });
+  let errTxt = ""; p.stderr.on("data", (d) => { if (errTxt.length < 400) errTxt += d; });
   let started = false;
   p.stdout.on("data", (b) => {
     if (!started) { started = true; res.writeHead(200, { "content-type": "audio/mpeg", "cache-control": "no-store" }); }
@@ -136,7 +137,7 @@ function streamMp3(src, res) {
   });
   const stop = () => p.kill("SIGKILL");
   res.on("close", stop);
-  p.on("close", () => { if (!started) json(res, 502, { error: "the source did not deliver audio" }); else res.end(); });
+  p.on("close", () => { if (!started) json(res, 502, { error: "the source did not deliver audio", detail: errTxt.slice(-300) }); else res.end(); });
 }
 
 // interleaved-gradient-noise thresholds: a static pattern, so still areas stay still and deltas stay small

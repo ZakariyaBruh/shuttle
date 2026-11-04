@@ -319,7 +319,7 @@ static void open_menu(const char* id)
 		list_add2(l, "Pluto TV", "Free live channels", K_MENU, "pluto");
 		list_add2(l, "Free live news", "DW, Al Jazeera, Red Bull TV", K_RELAY_LIST, "/tv/free");
 		list_add2(l, "Classic TV and films", "Internet Archive", K_MENU, "archive");
-		list_add2(l, "My IPTV playlist", "Your own channels", K_MENU, "iptv");
+		list_add2(l, "IPTV channels", "Free worldwide channels", K_MENU, "iptv");
 	} else if (!strcmp(id, "pluto")) {
 		l = list_new("Pluto TV");
 		list_add2(l, "Pluto Movies", "Movie channels, Westerns, Sci-Fi", K_RELAY_LIST, "/pluto/movies");
@@ -346,10 +346,10 @@ static void open_menu(const char* id)
 		list_add2(l, "Nat Geo", "From @NatGeo", K_RELAY_LIST, "/yt/shorts?q=%40NatGeo");
 		list_add2(l, "Search Shorts", "A word or #tag", K_SEARCH, "shorts");
 	} else if (!strcmp(id, "iptv")) {
-		l = list_new("My IPTV");
+		l = list_new("IPTV");
 		list_add2(l, "Search channels", "By name", K_SEARCH, "iptv");
-		list_add2(l, "Groups", "Browse by category", K_RELAY_LIST, "/iptv/groups");
-		list_add2(l, "All channels", "Everything in your playlist", K_RELAY_LIST, "/iptv/channels");
+		list_add2(l, "Categories and countries", "News, music, sport, UK, US...", K_RELAY_LIST, "/iptv/groups");
+		list_add2(l, "All channels", "Only the ones that answer", K_RELAY_LIST, "/iptv/channels");
 	} else if (!strcmp(id, "archive")) {
 		l = list_new("Classic TV and films");
 		list_add2(l, "Search", "Internet Archive video", K_SEARCH, "ia");
@@ -1225,7 +1225,7 @@ static void submit_text(void)
 		list_add2(l, "YouTube", "Videos and episodes", K_SEARCH_IN, "yt");
 		list_add2(l, "YouTube Shorts", "Short clips", K_SEARCH_IN, "shorts");
 		list_add2(l, "Classic TV and films", "Internet Archive", K_SEARCH_IN, "ia");
-		list_add2(l, "My IPTV channels", "Your playlist", K_SEARCH_IN, "iptv");
+		list_add2(l, "IPTV channels", "Free worldwide channels", K_SEARCH_IN, "iptv");
 	}
 	push(l);
 }
@@ -1273,7 +1273,7 @@ static void draw_play(void)
 static const char* search_title(void)
 {
 	static const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"lib","Search the library"},
-		{"iptv","Search my IPTV"}, {"yt","Search YouTube"}, {"ia","Search classic TV"}, {"all","Search everything"}, {"chat","Message the AI"},
+		{"iptv","Search IPTV"}, {"yt","Search YouTube"}, {"ia","Search classic TV"}, {"all","Search everything"}, {"chat","Message the AI"},
 		{"pluto","Search live channels"}, {"shorts","Search Shorts"}, {"relay","Relay address"}, {"token","Relay token"} };
 	for (int i = 0; i < 13; i++) if (!strcmp(titles[i][0], textSource)) return titles[i][1];
 	return "Search";
