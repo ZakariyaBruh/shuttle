@@ -6,6 +6,7 @@
 #include <strings.h>
 #include <stdarg.h>
 #include "ui.h"
+#include "defaults.h"
 #include "art_layout.h"
 
 PlaydateAPI* pd;
@@ -222,6 +223,8 @@ IconId item_icon(const Item* it)
 
 static void load_settings(void)
 {
+	snprintf(relayHost, sizeof relayHost, "%s", DEFAULT_RELAY);
+	snprintf(relayToken, sizeof relayToken, "%s", DEFAULT_RELAY_TOKEN);
 	SDFile* f = pd->file->open("settings.json", kFileReadData);
 	if (!f) return;
 	static char buf[512];
