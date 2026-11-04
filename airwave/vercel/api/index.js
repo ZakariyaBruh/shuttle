@@ -111,7 +111,9 @@ async function lowVariant(src) {
   if (!/\.m3u8/.test(src.split("?")[0])) return src;
   return cached("low:" + src, 120e3, async () => {
     try {
-      const lines = (await getText(src, 10000)).split(/\r?\n/);
+      const txt = await getText(src, 10000);
+      if (/#EXT-X-MEDIA:[^\n]*TYPE=AUDIO/.test(txt)) return src;     // audio lives in a separate rendition: a single variant would be silent
+      const lines = txt.split(/\r?\n/);
       let best = null;
       lines.forEach((l, i) => {
         if (l.startsWith("#EXT-X-STREAM-INF") && lines[i + 1]) {
