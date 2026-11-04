@@ -119,7 +119,9 @@ async function lowVariant(src) {
           if (!best || bw < best.bw) best = { bw, url: lines[i + 1].trim() };
         }
       });
-      return best ? new URL(best.url, src).toString() : src;
+      if (!best) return src;
+      const v = new URL(best.url, src).toString();
+      try { await getText(v, 6000); return v; } catch { return src; }     // the smallest rendition is sometimes dead: use the master then
     } catch { return src; }
   });
 }
