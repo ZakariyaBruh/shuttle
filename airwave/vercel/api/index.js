@@ -44,6 +44,53 @@ async function plutoUrl(slug) {
   for (const [k, v] of Object.entries({ deviceId: crypto.randomUUID(), sid: crypto.randomUUID(), appName: "web", appVersion: "9.0.0", deviceType: "web", deviceMake: "chrome", deviceModel: "web", clientTime: "0" })) u.searchParams.set(k, v);
   return u.toString();
 }
+// ---------- IPTV: the free iptv-org playlists (or your own with the IPTV_URL variable). Stateless: a channel id is its base64url stream URL. ----------
+const IPTV_BASE = "https://iptv-org.github.io/iptv/";
+const IPTV_GROUPS = [["News", "categories/news"], ["Movies", "categories/movies"], ["Documentary", "categories/documentary"], ["Music", "categories/music"], ["Sports", "categories/sports"], ["Kids", "categories/kids"], ["Science", "categories/science"], ["Comedy", "categories/comedy"], ["Entertainment", "categories/entertainment"], ["Series", "categories/series"], ["Classic", "categories/classic"], ["Animation", "categories/animation"], ["Travel", "categories/travel"], ["Nature", "categories/outdoor"], ["United States", "countries/us"], ["United Kingdom", "countries/uk"], ["Canada", "countries/ca"], ["Australia", "countries/au"], ["Germany", "countries/de"], ["France", "countries/fr"], ["Spain", "countries/es"], ["Italy", "countries/it"], ["India", "countries/in"]];
+function parseM3u(text) {
+  const out = []; let cur = null;
+  for (const raw of text.split(/\r?\n/)) {
+    const l = raw.trim();
+    if (l.startsWith("#EXTINF")) { const i = l.lastIndexOf(","); cur = { name: i >= 0 ? l.slice(i + 1).trim() : "?", group: (/group-title="([^"]*)"/.exec(l) || [])[1] || "" }; }
+    else if (cur && l && !l.startsWith("#")) { if (/^https?:/.test(l) && !/\[(Geo-blocked|Not 24\/7)\]/i.test(cur.name)) { cur.url = l; out.push(cur); } cur = null; }
+  }
+  return out;
+}
+async function iptvChannels(group) {
+  const g = IPTV_GROUPS.find((x) => x[0] === group);
+  const path = group === "My playlist" ? null : g ? g[1] : "index";
+  const src = path === null ? process.env.IPTV_URL : IPTV_BASE + path + ".m3u";
+  if (!src) return [];
+  return cached("iptv:" + src, 1800e3, async () => parseM3u(await getText(src, 40000)));
+}
+// Most free IPTV links are dead at any moment: probe them and only list the ones that answer.
+const alive = new Map();
+async function probe(url) {
+  const hit = alive.get(url);
+  if (hit && Date.now() - hit.t < 1200e3) return hit.ok;
+  let ok = false;
+  try {
+    const r = await fetch(url, { headers: { "user-agent": UA }, signal: AbortSignal.timeout(3500) });
+    if (r.ok) {
+      const rd = r.body.getReader(); const { value } = await rd.read(); rd.cancel().catch(() => {});
+      ok = !!value && (!/\.m3u8/.test(url.split("?")[0]) || Buffer.from(value.subarray(0, 7)).toString() === "#EXTM3U");
+    }
+  } catch {}
+  alive.set(url, { t: Date.now(), ok });
+  return ok;
+}
+async function livePage(rows, off, per) {
+  const out = []; let i = off;
+  while (out.length < per && i < rows.length) {
+    const batch = rows.slice(i, i + 48);
+    const res = await Promise.all(batch.map((c) => probe(c.url)));
+    for (let k = 0; k < batch.length && out.length < per; k++) { i++; if (res[k]) out.push(batch[k]); }
+  }
+  return { out, next: i, left: rows.length - i };
+}
+const b64u = (s) => Buffer.from(s).toString("base64url");
+const iptvRow = (c) => ({ name: c.name.slice(0, 78), sub: (c.group || "").slice(0, 50), path: `/iptv/audio/${b64u(c.url)}`, video: `/iptv/video/${b64u(c.url)}` });
+
 async function iaList(q, page = 1) {
   const url = "https://archive.org/advancedsearch.php?" + new URLSearchParams([["q", `(${q}) AND mediatype:movies`], ["fl[]", "identifier"], ["fl[]", "title"], ["fl[]", "creator"], ["rows", "30"], ["page", String(page)], ["sort[]", "downloads desc"], ["output", "json"]]);
   const docs = (await getJson(url)).response.docs;
@@ -182,10 +229,10 @@ module.exports = async (req, res) => {
     if (p === "/chat" && req.method === "POST") return await chat(req, res);
     if (p === "/t.mp3") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamMp3(await lowVariant(s), res); }
     if (p === "/v") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamVideo(await lowVariant(s), res, q.get("fit")); }
-    let m = /^\/(free|pluto|ia)\/(audio|video)\/([\w.\-]+?)(?:\.mp3)?$/.exec(p);
+    let m = /^\/(free|pluto|ia|iptv)\/(audio|video)\/([\w.\-=]+?)(?:\.mp3)?$/.exec(p);
     if (m) {
       const [, kind, mode, id] = m;
-      let src = kind === "free" ? (FREE_LIVE[Number(id)] || [])[1] : kind === "pluto" ? await plutoUrl(id) : await iaMediaUrl(id);
+      let src = kind === "free" ? (FREE_LIVE[Number(id)] || [])[1] : kind === "pluto" ? await plutoUrl(id) : kind === "iptv" ? Buffer.from(id, "base64url").toString() : await iaMediaUrl(id);
       if (!src) return json(res, 404, { error: "unknown channel" });
       src = await lowVariant(src);
       return mode === "audio" ? streamMp3(src, res) : streamVideo(src, res, q.get("fit") === "cover" ? "cover" : "contain");
@@ -208,6 +255,20 @@ module.exports = async (req, res) => {
     }
     if (p === "/ia/search") return json(res, 200, await iaList(q.get("q") || "", Number(q.get("page") || 1)));
     if (p.startsWith("/yt/") || p === "/tv/shows") return json(res, 501, { error: "YouTube isn't available on this host (YouTube blocks cloud servers)" });
+    if (p === "/iptv/groups") {
+      const g = IPTV_GROUPS.map(([n]) => ({ name: n, path: "/iptv/channels?group=" + encodeURIComponent(n), kind: "list" }));
+      if (process.env.IPTV_URL) g.unshift({ name: "My playlist", path: "/iptv/channels?group=My%20playlist", kind: "list" });
+      return json(res, 200, g);
+    }
+    if (p === "/iptv/channels") {
+      const group = q.get("group") || "", term = (q.get("q") || "").toLowerCase(), off = Number(q.get("offset") || 0);
+      const rows = (await iptvChannels(group)).filter((c) => !term || c.name.toLowerCase().includes(term));
+      const params = {}; for (const [k, v] of q) if (k !== "offset" && k !== "k") params[k] = v;
+      const pg = await livePage(rows, off, 30);
+      const items = pg.out.map(iptvRow);
+      if (pg.left > 0) items.push({ name: `More... (${pg.left} to check)`, path: "/iptv/channels?" + new URLSearchParams({ ...params, offset: String(pg.next) }), kind: "list" });
+      return json(res, 200, items);
+    }
     if (p.startsWith("/iptv/")) return json(res, 200, []);
     return json(res, 404, { error: "not found" });
   } catch (e) {
