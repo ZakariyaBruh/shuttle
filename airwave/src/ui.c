@@ -1,4 +1,4 @@
-/* Airwave UI toolkit: fonts, icons, header/hints, animated lists, the home carousel, cards, spinner, cover art. */
+/* Airwave UI toolkit: fonts + text alignment, icons, header/hints, animated lists, the home carousel, cards, spinner, cover art. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -7,11 +7,51 @@
 LCDFont *fBody, *fBold, *fBig, *fTitle, *fSmall;
 int viewW = 400;
 
-#define ROW_H 40
+#define ROW_H 38
 #define LIST_TOP 36
-#define LIST_H 176
+#define LIST_H 178
 
 uint32_t now_ms(void) { return pd->system->getCurrentTimeMilliseconds(); }
+
+/* ---------- fonts and measured text metrics ---------- */
+
+typedef struct { LCDFont* f; int top, cap; } FMet;           /* top = distance from the line box top to the top of a capital */
+static FMet fmet[8];
+static int nmet;
+
+static void measure(LCDFont* f)
+{
+	if (!f || nmet >= 8) return;
+	FMet m = { f, 5, 11 };                                   /* sane defaults if measuring fails */
+	LCDBitmap* b = pd->graphics->newBitmap(48, 72, kColorWhite);
+	if (b) {
+		pd->graphics->pushContext(b);
+		pd->graphics->setFont(f);
+		pd->graphics->setDrawMode(kDrawModeFillBlack);
+		pd->graphics->drawText("H", 1, kUTF8Encoding, 6, 6);
+		pd->graphics->popContext();
+		uint8_t *data, *mask; int w, h, rb;
+		pd->graphics->getBitmapData(b, &w, &h, &rb, &mask, &data);
+		int first = -1, last = -1;
+		if (data) for (int y = 0; y < h; y++) {
+			bool ink = false;
+			for (int x = 0; x < w && !ink; x++) if (!((data[y * rb + (x >> 3)] >> (7 - (x & 7))) & 1)) ink = true;
+			if (ink) { if (first < 0) first = y; last = y; }
+		}
+		if (first >= 0) { m.top = first - 6; m.cap = last - first + 1; }
+		pd->graphics->freeBitmap(b);
+	}
+	fmet[nmet++] = m;
+}
+
+static const FMet* met(LCDFont* f)
+{
+	for (int i = 0; i < nmet; i++) if (fmet[i].f == f) return &fmet[i];
+	static const FMet dflt = { NULL, 5, 11 };
+	return &dflt;
+}
+
+int font_cap(LCDFont* f) { return met(f)->cap; }
 
 void ui_load_fonts(void)
 {
@@ -26,6 +66,7 @@ void ui_load_fonts(void)
 	if (!fSmall) fSmall = fBody;
 	if (!fBig) fBig = fBold;
 	if (!fTitle) fTitle = fBig;
+	measure(fBody); measure(fBold); measure(fSmall); measure(fBig); measure(fTitle);
 }
 
 void T(LCDFont* f, const char* s, int x, int y, LCDBitmapDrawMode m)
@@ -35,7 +76,14 @@ void T(LCDFont* f, const char* s, int x, int y, LCDBitmapDrawMode m)
 	pd->graphics->drawText(s, strlen(s), kUTF8Encoding, x, y);
 }
 int TW(LCDFont* f, const char* s) { return f ? pd->graphics->getTextWidth(f, s, strlen(s), kUTF8Encoding, 0) : (int)strlen(s) * 7; }
-void Tc(LCDFont* f, const char* s, int cx, int y, LCDBitmapDrawMode m) { T(f, s, cx - TW(f, s) / 2, y, m); }
+
+void Tm(LCDFont* f, const char* s, int x, int cy, LCDBitmapDrawMode m)
+{
+	const FMet* k = met(f);
+	T(f, s, x, cy - k->top - (k->cap + 1) / 2, m);
+}
+void Tmc(LCDFont* f, const char* s, int cx, int cy, LCDBitmapDrawMode m) { Tm(f, s, cx - TW(f, s) / 2, cy, m); }
+void Tmr(LCDFont* f, const char* s, int xr, int cy, LCDBitmapDrawMode m) { Tm(f, s, xr - TW(f, s), cy, m); }
 
 static const int COS12[12] = { 1000, 866, 500, 0, -500, -866, -1000, -866, -500, 0, 500, 866 };
 static const int SIN12[12] = { 0, 500, 866, 1000, 866, 500, 0, -500, -866, -1000, -866, -500 };
@@ -100,6 +148,10 @@ void ui_icon(IconId ic, int cx, int cy, int size, LCDColor c)
 			G->drawLine(X(29), Y(11), X(35), Y(2), L(2), c);
 			G->drawLine(X(12), Y(42), X(32), Y(42), L(3), c);
 			break;
+		case IC_YT:                                     /* rounded screen with a play triangle */
+			G->fillRoundRect(X(1), Y(8), L(42), L(28), L(9), c);
+			G->fillTriangle(X(17), Y(15), X(17), Y(29), X(30), Y(22), c == kColorBlack ? kColorWhite : kColorBlack);
+			break;
 		case IC_CHAT:
 			G->drawRoundRect(X(2), Y(4), L(40), L(28), L(8), L(3), c);
 			G->fillTriangle(X(9), Y(31), X(9), Y(42), X(21), Y(31), c);
@@ -148,7 +200,7 @@ void ui_icon(IconId ic, int cx, int cy, int size, LCDColor c)
 
 /* ---------- status icons (battery, Wi-Fi, relay) ---------- */
 
-static int ui_status(int xr, int y)                            /* right-aligned at xr; returns its width */
+static int ui_status(int xr, int cy)                           /* right-aligned at xr; returns its width */
 {
 	const struct playdate_graphics* G = pd->graphics;
 	int x = xr;
@@ -156,18 +208,18 @@ static int ui_status(int xr, int y)                            /* right-aligned 
 	if (pct < 0) pct = 0;
 	if (pct > 100) pct = 100;
 	x -= 24;
-	G->drawRoundRect(x, y, 21, 11, 3, 2, kColorBlack);
-	G->fillRect(x + 21, y + 3, 2, 5, kColorBlack);
+	G->drawRoundRect(x, cy - 6, 21, 12, 3, 2, kColorBlack);
+	G->fillRect(x + 21, cy - 2, 2, 4, kColorBlack);
 	int fw = (int)(15 * pct / 100.0f);
-	if (fw > 0) G->fillRect(x + 3, y + 3, fw, 5, kColorBlack);
+	if (fw > 0) G->fillRect(x + 3, cy - 3, fw, 6, kColorBlack);
 	x -= 8 + 16;
 	bool wifi = pd->network->getStatus() == kWifiConnected;
-	ui_icon(IC_WIFI, x + 8, y + 5, 16, kColorBlack);
-	if (!wifi) G->drawLine(x, y + 12, x + 16, y - 2, 2, kColorBlack);
+	ui_icon(IC_WIFI, x + 8, cy, 16, kColorBlack);
+	if (!wifi) G->drawLine(x, cy + 7, x + 16, cy - 7, 2, kColorBlack);
 	if (relay_configured()) {
-		x -= 8 + 24;
-		G->fillRoundRect(x, y - 1, 24, 13, 4, kColorBlack);
-		Tc(fSmall, "R", x + 12, y, kDrawModeFillWhite);
+		x -= 8 + 22;
+		G->fillRoundRect(x, cy - 7, 22, 14, 4, kColorBlack);
+		Tmc(fSmall, "R", x + 11, cy, kDrawModeFillWhite);
 	}
 	return xr - x;
 }
@@ -176,28 +228,29 @@ void ui_header(const char* title, const char* counter)
 {
 	const struct playdate_graphics* G = pd->graphics;
 	int stW = 0;
-	if (viewW >= 300) stW = ui_status(viewW - 12, 11) + 8;
-	int cw = (counter && counter[0]) ? TW(fSmall, counter) + 10 : 0;
-	int avail = viewW - 20 - stW - cw;
-	char t[80]; snprintf(t, sizeof t, "%s", title);
+	if (viewW >= 300) stW = ui_status(viewW - 12, 17) + 8;
+	int cw = (counter && counter[0]) ? TW(fSmall, counter) + 12 : 0;
+	int avail = viewW - 22 - stW - cw;
+	static char t[80]; snprintf(t, sizeof t, "%s", title);
 	LCDFont* hf = viewW < 300 ? fBold : fBig;                    /* a smaller title while the keyboard has the screen */
 	if (TW(hf, t) > avail) {
 		while (strlen(t) > 4 && TW(hf, t) > avail - 16) t[strlen(t) - 1] = 0;
 		strcat(t, "..");
 	}
-	T(hf, t, 10, hf == fBig ? 5 : 3, kDrawModeFillBlack);
-	if (cw) T(fSmall, counter, viewW - 12 - stW - cw + 6, 13, kDrawModeFillBlack);
-	G->fillRect(8, 31, viewW - 16, 2, kColorBlack);
+	Tm(hf, t, 10, 16, kDrawModeFillBlack);
+	if (cw) Tmr(fSmall, counter, viewW - 12 - stW, 17, kDrawModeFillBlack);
+	G->fillRect(8, 33, viewW - 16, 2, kColorBlack);
 }
 
 /* ---------- button hints ---------- */
 
-static void glyph(const char* g, int x, int y)                   /* 16x16 */
+static void glyph(const char* g, int x, int cy)                  /* 16x16, centred vertically on cy */
 {
 	const struct playdate_graphics* G = pd->graphics;
+	int y = cy - 8;
 	if (!strcmp(g, "A") || !strcmp(g, "B")) {
 		G->fillEllipse(x, y, 16, 16, 0, 0, kColorBlack);
-		Tc(fSmall, g, x + 8, y + 1, kDrawModeFillWhite);
+		Tmc(fSmall, g, x + 8, cy, kDrawModeFillWhite);
 	} else if (!strcmp(g, "UD")) {
 		G->fillTriangle(x + 8, y, x + 2, y + 6, x + 14, y + 6, kColorBlack);
 		G->fillTriangle(x + 8, y + 15, x + 2, y + 9, x + 14, y + 9, kColorBlack);
@@ -213,9 +266,9 @@ static void glyph(const char* g, int x, int y)                   /* 16x16 */
 void ui_hints(const char* spec)
 {
 	const struct playdate_graphics* G = pd->graphics;
-	G->fillRect(0, 217, viewW, 23, kColorWhite);
-	ui_fade(8, 217, viewW - 16, 1, true, 8);
-	int x = 10;
+	G->fillRect(0, 218, viewW, 22, kColorWhite);
+	ui_fade(8, 218, viewW - 16, 1, true, 8);
+	int x = 10, cy = 229;
 	const char* p = spec;
 	while (*p) {
 		char tok[40]; int n = 0;
@@ -227,13 +280,13 @@ void ui_hints(const char* spec)
 		const char* label = sp + 1;
 		int w = 16 + 5 + TW(fSmall, label);
 		if (x + w > viewW - 6) break;
-		glyph(tok, x, 221);
-		T(fSmall, label, x + 21, 222, kDrawModeFillBlack);
+		glyph(tok, x, cy);
+		Tm(fSmall, label, x + 21, cy, kDrawModeFillBlack);
 		x += w + 16;
 	}
 }
 
-/* word-wrap helper; returns the number of lines drawn */
+/* word-wrap helper; y = vertical centre of the first line; returns the number of lines drawn */
 int ui_wrap(const char* text, int x, int y, int w, int maxLines, LCDFont* f, int lineH, LCDBitmapDrawMode m)
 {
 	static char line[120];
@@ -250,7 +303,7 @@ int ui_wrap(const char* text, int x, int y, int w, int maxLines, LCDFont* f, int
 		if (s[n] && s[n] != '\n' && lastSpace > 0 && n < 110) n = lastSpace;   /* break at the last space */
 		if (n == 0) n = 1;
 		snprintf(line, sizeof line, "%.*s", n, s);
-		T(f, line, x, y + lines * lineH, m);
+		Tm(f, line, x, y + lines * lineH, m);
 		lines++;
 		s += n;
 		if (*s == '\n' || *s == ' ') s++;
@@ -265,7 +318,8 @@ static void row_glyph(const Item* it, int cx, int cy, LCDColor c)
 {
 	if (item_locked(it)) { ui_icon(IC_LOCK, cx, cy, 14, c); return; }
 	switch (it->kind) {
-		case K_MENU: case K_RADIO_Q: case K_RELAY_LIST: case K_TUNEIN_LIST: case K_IA_Q: case K_POD_CHARTS: case K_POD_ID: case K_POD_FEED: case K_IA_ITEM:
+		case K_MENU: case K_RADIO_Q: case K_RELAY_LIST: case K_TUNEIN_LIST: case K_IA_Q: case K_POD_CHARTS: case K_POD_GENRES: case K_POD_GENRE:
+		case K_POD_ID: case K_POD_FEED: case K_IA_ITEM:
 			ui_icon(IC_FOLDER, cx, cy, 14, c); break;
 		case K_PLAY: case K_PLAY_VIDEO: case K_TUNEIN_PLAY: ui_icon(IC_PLAY, cx, cy, 14, c); break;
 		default: break;
@@ -275,7 +329,7 @@ static void row_glyph(const Item* it, int cx, int cy, LCDColor c)
 void ui_list(List* l)
 {
 	const struct playdate_graphics* G = pd->graphics;
-	if (l->n == 0) { Tc(fBold, "Nothing here yet", viewW / 2, 100, kDrawModeFillBlack); return; }
+	if (l->n == 0) { Tmc(fBold, "Nothing here yet", viewW / 2, 110, kDrawModeFillBlack); return; }
 	int maxScroll = l->n * ROW_H > LIST_H ? l->n * ROW_H - LIST_H : 0;
 	float target = l->sel * ROW_H - 1.5f * ROW_H;
 	if (target < 0) target = 0;
@@ -286,19 +340,21 @@ void ui_list(List* l)
 	if (l->selY - (l->sel * ROW_H) < 0.6f && l->selY - (l->sel * ROW_H) > -0.6f) l->selY = (float)(l->sel * ROW_H);
 	int barW = viewW - 12 - (l->n * ROW_H > LIST_H ? 8 : 0);
 
-	G->setClipRect(0, LIST_TOP - 2, viewW, LIST_H + 4);
+	G->setClipRect(0, LIST_TOP - 1, viewW, LIST_H + 2);
 	int by = LIST_TOP + (int)l->selY - (int)l->scrollY;
 	G->fillRoundRect(6, by + 1, barW, ROW_H - 3, 10, kColorBlack);
 	int first = (int)(l->scrollY / ROW_H) - 1; if (first < 0) first = 0;
 	for (int i = first; i < l->n && i <= first + LIST_H / ROW_H + 2; i++) {
 		int y = LIST_TOP + i * ROW_H - (int)l->scrollY;
 		Item* it = &l->items[i];
-		bool onBar = (l->selY - i * ROW_H) < 18 && (l->selY - i * ROW_H) > -18;       /* text flips colour as the bar passes */
+		float d = l->selY - i * ROW_H;
+		bool onBar = d < 19 && d > -19;                                   /* text flips colour as the bar passes */
 		LCDColor ink = onBar ? kColorWhite : kColorBlack;
 		LCDBitmapDrawMode tm = onBar ? kDrawModeFillWhite : kDrawModeFillBlack;
+		int cy = y + 18;                                                  /* the row's centre line */
 		/* badge */
-		if (onBar) { G->fillRoundRect(14, y + 5, 28, 28, 8, kColorWhite); ui_icon(item_icon(it), 28, y + 19, 18, kColorBlack); }
-		else { G->drawRoundRect(14, y + 5, 28, 28, 8, 2, kColorBlack); ui_icon(item_icon(it), 28, y + 19, 18, kColorBlack); }
+		if (onBar) G->fillRoundRect(14, cy - 14, 28, 28, 8, kColorWhite); else G->drawRoundRect(14, cy - 14, 28, 28, 8, 2, kColorBlack);
+		ui_icon(item_icon(it), 28, cy, 18, kColorBlack);
 		/* text, shortened with an ellipsis to the room left of the glyph */
 		int tx = 52, room = barW - 46 - 26;
 		static char lab[96]; snprintf(lab, sizeof lab, "%.80s", it->label);
@@ -308,12 +364,12 @@ void ui_list(List* l)
 			strcat(lab, "...");
 		}
 		if (it->sub[0]) {
-			T(fBold, lab, tx, y - 2, tm);
+			Tm(fBold, lab, tx, cy - 7, tm);
 			static char sb[64]; snprintf(sb, sizeof sb, "%s", it->sub);
 			if (TW(fSmall, sb) > room) { while (strlen(sb) > 4 && TW(fSmall, sb) > room - 10) sb[strlen(sb) - 1] = 0; strcat(sb, ".."); }
-			T(fSmall, sb, tx, y + 18, tm);
-		} else T(fBold, lab, tx, y + 7, tm);
-		row_glyph(it, 6 + barW - 16, y + 19, ink);
+			Tm(fSmall, sb, tx, cy + 8, tm);
+		} else Tm(fBold, lab, tx, cy, tm);
+		row_glyph(it, 6 + barW - 16, cy, ink);
 	}
 	G->clearClipRect();
 	if (viewW < 400) G->setClipRect(0, 0, viewW, 240);
@@ -329,10 +385,11 @@ void ui_list(List* l)
 
 static const struct { const char* name; const char* sub; IconId ic; } HOME[] = {
 	{ "Radio", "Stations from around the world", IC_RADIO },
-	{ "Podcasts", "Apple charts and search", IC_POD },
-	{ "Library", "Old-time radio, audiobooks", IC_LIB },
 	{ "TuneIn", "The radio directory", IC_TUNEIN },
-	{ "TV & Video", "Live channels, shows, Shorts", IC_TV },
+	{ "Podcasts", "Charts, categories, search", IC_POD },
+	{ "Library", "Old-time radio, audiobooks", IC_LIB },
+	{ "TV", "Live channels and classic shows", IC_TV },
+	{ "YouTube", "Documentaries and Shorts", IC_YT },
 	{ "AI Chat", "Ask anything, no sign-in", IC_CHAT },
 	{ "Search", "Find anything at once", IC_SEARCH },
 	{ "Setup", "Wi-Fi and relay", IC_SETUP },
@@ -345,20 +402,24 @@ static void home_card(int i, float dx, bool selected)
 	float adx = dx < 0 ? -dx : dx;
 	float t = adx > 1 ? 1 : adx;
 	float k = 1.0f - 0.36f * t;
-	int w = (int)(150 * k), h = (int)(164 * k);
+	int w = (int)(150 * k), h = (int)(160 * k);
 	int cx = 200 + (int)(dx * 134), cy = 118;
 	int x = cx - w / 2, y = cy - h / 2;
 	if (x > 400 || x + w < 0) return;
 	if (selected) {
 		ui_fade(x + 4, y + 5, w, h, true, 7);                                  /* soft drop shadow */
 		G->fillRoundRect(x, y, w, h, 14, kColorBlack);
-		ui_icon(HOME[i].ic, cx, y + 50, 70, kColorWhite);
-		Tc(fTitle, HOME[i].name, cx, y + 93, kDrawModeFillWhite);
-		ui_wrap(HOME[i].sub, x + 12, y + 126, w - 24, 2, fSmall, 13, kDrawModeFillWhite);
+		ui_icon(HOME[i].ic, cx, y + 46, 66, kColorWhite);
+		Tmc(fTitle, HOME[i].name, cx, y + 92, kDrawModeFillWhite);
+		ui_wrap(HOME[i].sub, x + 12, y + 120, w - 24, 2, fSmall, 14, kDrawModeFillWhite);
 	} else {
 		G->fillRoundRect(x, y, w, h, 12, kColorWhite);
 		G->drawRoundRect(x, y, w, h, 12, 2, kColorBlack);
 		ui_icon(HOME[i].ic, cx, cy, (int)(46 * k), kColorBlack);
+	}
+	if (selected && !relay_configured() && (i == 4 || i == 5)) {                  /* TV and YouTube need the relay: small padlock badge */
+		G->fillEllipse(x + w - 30, y + 8, 22, 22, 0, 0, kColorWhite);
+		ui_icon(IC_LOCK, x + w - 19, y + 19, 14, kColorBlack);
 	}
 }
 
@@ -397,14 +458,14 @@ void ui_spinner(int cx, int cy, int r)
 void ui_card(IconId ic, const char* title, const char* body)
 {
 	const struct playdate_graphics* G = pd->graphics;
-	int w = viewW - 40 > 350 ? 350 : viewW - 40, x = (viewW - w) / 2, y = 42, h = 164;
+	int w = viewW - 40 > 350 ? 350 : viewW - 40, x = (viewW - w) / 2, y = 44, h = 160;
 	ui_fade(x + 4, y + 5, w, h, true, 7);
 	G->fillRoundRect(x, y, w, h, 12, kColorWhite);
 	G->drawRoundRect(x, y, w, h, 12, 2, kColorBlack);
 	G->fillEllipse(x + 16, y + 16, 44, 44, 0, 0, kColorBlack);
 	ui_icon(ic, x + 38, y + 38, 26, kColorWhite);
-	T(fBig, title, x + 72, y + 24, kDrawModeFillBlack);
-	ui_wrap(body, x + 18, y + 68, w - 36, 5, fBody, 18, kDrawModeFillBlack);
+	Tm(fBig, title, x + 72, y + 38, kDrawModeFillBlack);
+	ui_wrap(body, x + 18, y + 82, w - 36, 5, fBody, 19, kDrawModeFillBlack);
 }
 
 static uint32_t hash_str(const char* s) { uint32_t h = 2166136261u; while (*s) { h ^= (uint8_t)*s++; h *= 16777619u; } return h; }
@@ -465,11 +526,11 @@ void ui_eq(int x, int y, int w, int h, bool active)
 	}
 }
 
-int ui_chip(int x, int y, const char* text, bool filled)
+int ui_chip(int x, int y, const char* text, bool filled)                      /* 18 high; y = top */
 {
-	int w = TW(fSmall, text) + 14;
-	if (filled) { pd->graphics->fillRoundRect(x, y, w, 16, 8, kColorBlack); T(fSmall, text, x + 7, y + 2, kDrawModeFillWhite); }
-	else { pd->graphics->drawRoundRect(x, y, w, 16, 8, 2, kColorBlack); T(fSmall, text, x + 7, y + 2, kDrawModeFillBlack); }
+	int w = TW(fSmall, text) + 16;
+	if (filled) { pd->graphics->fillRoundRect(x, y, w, 18, 9, kColorBlack); Tmc(fSmall, text, x + w / 2, y + 9, kDrawModeFillWhite); }
+	else { pd->graphics->drawRoundRect(x, y, w, 18, 9, 2, kColorBlack); Tmc(fSmall, text, x + w / 2, y + 9, kDrawModeFillBlack); }
 	return w;
 }
 
