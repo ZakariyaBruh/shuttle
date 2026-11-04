@@ -129,7 +129,7 @@ async function lowVariant(src) {
 }
 
 // ---------- ffmpeg ----------
-function inputOpts(src) { return /^https?:/.test(src) ? ["-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
+function inputOpts(src) { return /^https?:/.test(src) ? ["-analyzeduration", "8000000", "-probesize", "8000000", "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
 
 function streamMp3(src, res) {
   const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", ...inputOpts(src), "-i", src, "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "64k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:1"], { stdio: ["ignore", "pipe", "pipe"] });
