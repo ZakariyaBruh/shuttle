@@ -1,0 +1,8 @@
+{
+  "name": "airwave-relay-vercel",
+  "version": "2.5.0",
+  "private": true,
+  "description": "Airwave relay as a Vercel Function: ffmpeg-static converts audio and dithers video to 1 bit for the Playdate.",
+  "engines": { "node": "22.x" },
+  "dependencies": { "ffmpeg-static": "^5.2.0" }
+}

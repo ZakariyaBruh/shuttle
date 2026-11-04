@@ -5,14 +5,14 @@
 
 /* Shared UI types (the app logic in main.c fills them, ui.c draws them). */
 typedef enum {
-	K_NONE, K_MENU, K_RADIO_Q, K_SEARCH, K_SEARCH_ALL, K_SEARCH_IN, K_POD_CHARTS, K_POD_ID, K_POD_FEED,
+	K_NONE, K_MENU, K_RADIO_Q, K_SEARCH, K_SEARCH_ALL, K_SEARCH_IN, K_POD_CHARTS, K_POD_GENRES, K_POD_GENRE, K_POD_ID, K_POD_FEED,
 	K_RELAY_LIST, K_PLAY, K_PLAY_VIDEO,
 	K_TUNEIN_LIST, K_TUNEIN_PLAY, K_IA_Q, K_IA_ITEM,
 	K_RELAY_EDIT, K_TOKEN_EDIT, K_RELAY_TEST, K_INFO
 } Kind;
 
 typedef enum {
-	IC_SEARCH, IC_RADIO, IC_POD, IC_LIB, IC_TUNEIN, IC_TV, IC_CHAT, IC_SETUP,
+	IC_SEARCH, IC_RADIO, IC_POD, IC_LIB, IC_TUNEIN, IC_TV, IC_YT, IC_CHAT, IC_SETUP,
 	IC_PLAY, IC_FOLDER, IC_VIDEO, IC_LOCK, IC_LIST, IC_INFO, IC_WIFI, IC_CHECK
 } IconId;
 
@@ -24,9 +24,15 @@ extern int viewW;                                   /* width left of the keyboar
 
 uint32_t now_ms(void);
 void ui_load_fonts(void);
-void T(LCDFont* f, const char* s, int x, int y, LCDBitmapDrawMode m);
+
+/* Text. Everything is placed by the vertical CENTRE of the capital letters (measured from the real font at start-up),
+   so text lines up the same way in every font and size. */
+void T(LCDFont* f, const char* s, int x, int y, LCDBitmapDrawMode m);      /* raw: y = top of the line box */
 int TW(LCDFont* f, const char* s);
-void Tc(LCDFont* f, const char* s, int cx, int y, LCDBitmapDrawMode m);
+void Tm(LCDFont* f, const char* s, int x, int cy, LCDBitmapDrawMode m);    /* left aligned, caps centred on cy */
+void Tmc(LCDFont* f, const char* s, int cx, int cy, LCDBitmapDrawMode m);  /* centred both ways */
+void Tmr(LCDFont* f, const char* s, int xr, int cy, LCDBitmapDrawMode m);  /* right aligned */
+int font_cap(LCDFont* f);                                                  /* cap height in pixels */
 
 /* hooks implemented by the app */
 bool item_locked(const Item* it);                   /* needs the relay and none is set */
@@ -37,7 +43,7 @@ void ui_fade(int x, int y, int w, int h, bool black, int level);   /* ordered-di
 void ui_icon(IconId ic, int cx, int cy, int size, LCDColor c);
 void ui_header(const char* title, const char* counter);
 void ui_hints(const char* spec);                   /* "A Open|B Back|UD Switch|LR Browse|C Scroll" */
-int ui_wrap(const char* text, int x, int y, int w, int maxLines, LCDFont* f, int lineH, LCDBitmapDrawMode m);
+int ui_wrap(const char* text, int x, int y, int w, int maxLines, LCDFont* f, int lineH, LCDBitmapDrawMode m);   /* y = centre of the first line */
 void ui_list(List* l);
 void ui_home(int sel, float pos);
 int ui_home_count(void);
