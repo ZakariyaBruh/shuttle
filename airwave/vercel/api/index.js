@@ -7,7 +7,7 @@ const fs = require("fs");
 
 const FFMPEG = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const TOKEN = process.env.AIRWAVE_TOKEN || "";
-const UA = "AirwaveRelay/2.6";
+const UA = "AirwaveRelay/2.8";
 const W = 400, H = 240, STRIDE = 52, FPS = 15, SRC_ROW = 50, KEY_EVERY = 90;
 
 const FREE_LIVE = [
@@ -315,7 +315,7 @@ module.exports = async (req, res) => {
     const q = u.searchParams;
     if (TOKEN && q.get("k") !== TOKEN) return json(res, 403, { error: "bad token" });
     const p = u.pathname;
-    if (p === "/health") return json(res, 200, { ok: true, version: "2.6", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no", stt: process.env.CF_API_TOKEN ? "cloudflare" : process.env.AI_GATEWAY_API_KEY ? "gateway" : "no" });
+    if (p === "/health") return json(res, 200, { ok: true, version: "2.8", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no", stt: process.env.CF_API_TOKEN ? "cloudflare" : process.env.AI_GATEWAY_API_KEY ? "gateway" : "no" });
     if (p === "/chat" && req.method === "POST") return await chat(req, res);
     if (p === "/stt" && req.method === "POST") return await stt(req, res, q);
     if (p === "/t.mp3") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamMp3(await lowVariant(s), res); }
