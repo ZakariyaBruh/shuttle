@@ -93,7 +93,7 @@ void ui_fade(int x, int y, int w, int h, bool black, int level)
 {
 	static const uint8_t bayer[4][4] = { {0, 8, 2, 10}, {12, 4, 14, 6}, {3, 11, 1, 9}, {15, 7, 13, 5} };
 	if (level <= 0) return;
-	static uint8_t pat[16];                          /* 8 rows of colour, then 8 rows of mask */
+	static uint8_t pat[16] __attribute__((aligned(8)));                          /* 8 rows of colour, then 8 rows of mask */
 	for (int r = 0; r < 8; r++) {
 		uint8_t mask = 0;
 		for (int c = 0; c < 8; c++) if (bayer[r & 3][c & 3] < level) mask |= (uint8_t)(0x80 >> c);

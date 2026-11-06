@@ -3,6 +3,7 @@
 // (pts_ms:u32le, flags:u8 bit0=key, PackBits of the XOR delta of 52*240 LCD bytes).
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+const fs = require("fs");
 
 const FFMPEG = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const TOKEN = process.env.AIRWAVE_TOKEN || "";
@@ -31,18 +32,36 @@ const getText = async (url, ms = 15000) => {
 const getJson = async (url, ms) => JSON.parse(await getText(url, ms));
 
 // ---------- sources ----------
+// Pluto's old v2 endpoints now play a "this device is no longer supported" clip. The current web client boots a session (JWT) and
+// gets channels and stitched playlists from the servers named in the boot reply, so do the same.
+let plutoSess = null;
+async function plutoSession() {
+  if (plutoSess && Date.now() < plutoSess.exp) return plutoSess;
+  const id = crypto.randomUUID();
+  const d = await getJson("https://boot.pluto.tv/v4/start?" + new URLSearchParams({ appName: "web", appVersion: "9.0.0", deviceVersion: "120.0.0", deviceModel: "web", deviceMake: "chrome", deviceType: "web", clientID: id, clientModelNumber: "1.0.0", serverSideAds: "false", drmCapabilities: "widevine:L3" }), 20000);
+  if (!d.sessionToken) throw new Error("Pluto did not start a session");
+  plutoSess = { token: d.sessionToken, params: d.stitcherParams, servers: d.servers, exp: Date.now() + Math.min((d.refreshInSec || 7200) * 500, 3600e3) };
+  return plutoSess;
+}
+async function plutoGet(path) {
+  const s = await plutoSession();
+  const r = await fetch(s.servers.channels + path, { headers: { "user-agent": UA, authorization: "Bearer " + s.token }, signal: AbortSignal.timeout(30000) });
+  if (!r.ok) throw new Error(`Pluto HTTP ${r.status}`);
+  return r.json();
+}
 async function plutoChannels() {
   return cached("pluto", 3600e3, async () => {
-    const d = await getJson("https://api.pluto.tv/v2/channels", 30000);
-    return d.filter((c) => c.isStitched && c.category !== "Testing").sort((a, b) => (a.category + a.number).localeCompare(b.category + b.number));
+    const [cats, chans] = await Promise.all([plutoGet("/v2/guide/categories"), plutoGet("/v2/guide/channels?limit=1000")]);
+    const names = {}; for (const c of cats.data || []) names[c.id] = c.name;
+    return (chans.data || []).filter((c) => c.isStitched).map((c) => ({ id: c.id, slug: c.slug, name: c.name, number: Number(c.number) || 0, category: names[(c.categoryIDs || [])[0]] || "Other" }))
+      .sort((a, b) => a.category.localeCompare(b.category) || a.number - b.number);
   });
 }
 async function plutoUrl(slug) {
   const c = (await plutoChannels()).find((x) => x.slug === slug);
   if (!c) throw new Error("unknown Pluto channel");
-  const u = new URL(c.stitched.urls[0].url);
-  for (const [k, v] of Object.entries({ deviceId: crypto.randomUUID(), sid: crypto.randomUUID(), appName: "web", appVersion: "9.0.0", deviceType: "web", deviceMake: "chrome", deviceModel: "web", clientTime: "0" })) u.searchParams.set(k, v);
-  return u.toString();
+  const s = await plutoSession();
+  return `${s.servers.stitcher}/v2/stitch/hls/channel/${c.id}/master.m3u8?${s.params}&jwt=${s.token}&masterJWTPassthrough=true&includeExtendedEvents=true`;
 }
 // ---------- IPTV: the free iptv-org playlists (or your own with the IPTV_URL variable). Stateless: a channel id is its base64url stream URL. ----------
 const IPTV_BASE = "https://iptv-org.github.io/iptv/";
@@ -52,7 +71,7 @@ function parseM3u(text) {
   for (const raw of text.split(/\r?\n/)) {
     const l = raw.trim();
     if (l.startsWith("#EXTINF")) { const i = l.lastIndexOf(","); cur = { name: i >= 0 ? l.slice(i + 1).trim() : "?", group: (/group-title="([^"]*)"/.exec(l) || [])[1] || "" }; }
-    else if (cur && l && !l.startsWith("#")) { if (/^https?:/.test(l) && !/\[(Geo-blocked|Not 24\/7)\]/i.test(cur.name)) { cur.url = l; out.push(cur); } cur = null; }
+    else if (cur && l && !l.startsWith("#")) { if (/^https?:/.test(l) && l.length <= 300 && !/\[(Geo-blocked|Not 24\/7)\]/i.test(cur.name)) { cur.url = l; out.push(cur); } cur = null; }
   }
   return out;
 }
@@ -112,8 +131,21 @@ async function lowVariant(src) {
   return cached("low:" + src, 120e3, async () => {
     try {
       const txt = await getText(src, 10000);
-      if (/#EXT-X-MEDIA:[^\n]*TYPE=AUDIO/.test(txt)) return src;     // audio lives in a separate rendition: a single variant would be silent
       const lines = txt.split(/\r?\n/);
+      if (/#EXT-X-MEDIA:[^\n]*TYPE=AUDIO/.test(txt)) {
+        // audio lives in separate renditions: write a trimmed master (smallest video + the audio groups) so ffmpeg doesn't pull 1080p
+        let low = null;
+        lines.forEach((l, i) => { if (l.startsWith("#EXT-X-STREAM-INF") && lines[i + 1]) { const m = /BANDWIDTH=(\d+)/.exec(l); const bw = m ? Number(m[1]) : Infinity; if (!low || bw < low.bw) low = { bw, inf: l, url: lines[i + 1].trim() }; } });
+        if (!low) return src;
+        const abs = (u) => new URL(u, src).toString();
+        await getText(abs(low.url), 6000);
+        const out = ["#EXTM3U"];
+        for (const l of lines) if (/^#EXT-X-MEDIA:/.test(l) && /TYPE=AUDIO/.test(l)) out.push(l.replace(/URI="([^"]+)"/, (_, u) => `URI="${abs(u)}"`));
+        out.push(low.inf.replace(/,?SUBTITLES="[^"]*"/, "").replace(/,?CLOSED-CAPTIONS="[^"]*"/, ""), abs(low.url));
+        const f = "/tmp/m-" + crypto.createHash("sha1").update(src).digest("hex").slice(0, 16) + ".m3u8";
+        fs.writeFileSync(f, out.join("\n") + "\n");
+        return f;
+      }
       let best = null;
       lines.forEach((l, i) => {
         if (l.startsWith("#EXT-X-STREAM-INF") && lines[i + 1]) {
@@ -129,7 +161,7 @@ async function lowVariant(src) {
 }
 
 // ---------- ffmpeg ----------
-function inputOpts(src) { return /^https?:/.test(src) ? ["-analyzeduration", "8000000", "-probesize", "8000000", "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
+function inputOpts(src) { if (src.startsWith("/tmp/m-")) return ["-protocol_whitelist", "file,http,https,tcp,tls,crypto", "-user_agent", UA]; return /^https?:/.test(src) ? ["-analyzeduration", "8000000", "-probesize", "8000000", "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
 
 function streamMp3(src, res) {
   const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", ...inputOpts(src), "-i", src, "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "64k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:1"], { stdio: ["ignore", "pipe", "pipe"] });

@@ -492,7 +492,7 @@ static void parse_relay_list(Req* r)
 	List* l = list_new(pendingTitle);
 	const char* cur = arr; Span o;
 	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
-		static char name[120], sub[56], path[480], video[200], kind[16], a[500];
+		static char name[120], sub[56], path[480], video[480], kind[16], a[520];
 		json_get_str(o, "name", name, sizeof name);
 		json_get_str(o, "sub", sub, sizeof sub);
 		json_get_str(o, "path", path, sizeof path);
@@ -1541,7 +1541,7 @@ static void app_update(int left, bool keyboardOn)
 	/* the next system: when an on-demand item ends, play the next one in its list; when a live stream drops (server time caps,
 	   Wi-Fi hiccups) reconnect it a few times */
 	if (stream && stream->status < 0 && !strcmp(stream->error, "stream ended") && (mode == M_PLAY || mode == M_VIDEO) && vqCount == 0 && !playReq.pending && (started || vGotFrame) && now_ms() - startedAt > 4000) {
-		if (!playOnDemand && resumeCount < 4) { resumeCount++; char t[80], a[1100]; snprintf(t, sizeof t, "%s", playTitle); snprintf(a, sizeof a, "%s", playArg); request_play(t, a, mode == M_VIDEO); }
+		if (!playOnDemand && resumeCount < 4) { resumeCount++; static char t[80], a[1100]; snprintf(t, sizeof t, "%s", playTitle); snprintf(a, sizeof a, "%s", playArg); request_play(t, a, mode == M_VIDEO); }
 		else if (playOnDemand && next_index(1) >= 0) surf(1);
 	}
 
