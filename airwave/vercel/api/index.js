@@ -161,7 +161,7 @@ async function lowVariant(src) {
 }
 
 // ---------- ffmpeg ----------
-function inputOpts(src) { if (src.startsWith("/tmp/m-")) return ["-protocol_whitelist", "file,http,https,tcp,tls,crypto", "-user_agent", UA]; return /^https?:/.test(src) ? ["-analyzeduration", "8000000", "-probesize", "8000000", "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
+function inputOpts(src) { if (src.startsWith("/tmp/m-")) return ["-protocol_whitelist", "file,http,https,tcp,tls,crypto"]; return /^https?:/.test(src) ? ["-analyzeduration", "8000000", "-probesize", "8000000", "-user_agent", UA, "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"] : []; }
 
 function streamMp3(src, res) {
   const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", ...inputOpts(src), "-i", src, "-vn", "-map", "0:a:0", "-ac", "1", "-ar", "44100", "-b:a", "64k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:1"], { stdio: ["ignore", "pipe", "pipe"] });
@@ -203,7 +203,8 @@ function streamVideo(src, res, fit) {
   const args = ["-hide_banner", "-loglevel", "error", "-re", ...inputOpts(src), "-i", src,
     "-map", "0:v:0", "-vf", vf, "-r", String(FPS), "-pix_fmt", "gray", "-f", "rawvideo", "pipe:1",
     "-map", "0:a:0?", "-ac", "1", "-ar", "44100", "-b:a", "48k", "-id3v2_version", "0", "-write_xing", "0", "-f", "mp3", "pipe:3"];
-  const p = spawn(FFMPEG, args, { stdio: ["ignore", "pipe", "ignore", "pipe"] });
+  const p = spawn(FFMPEG, args, { stdio: ["ignore", "pipe", "pipe", "pipe"] });
+  let errTxt = ""; p.stderr.on("data", (d) => { if (errTxt.length < 400) errTxt += d; });
   let started = false;
   const begin = () => { if (!started) { started = true; res.writeHead(200, { "content-type": "application/x-airwave-video", "cache-control": "no-store" }); } };
   let audio = [];
@@ -231,7 +232,7 @@ function streamVideo(src, res, fit) {
   });
   const stop = () => p.kill("SIGKILL");
   res.on("close", stop);
-  p.on("close", () => { if (!started) json(res, 502, { error: "the source did not deliver video" }); else res.end(); });
+  p.on("close", () => { if (!started) json(res, 502, { error: "the source did not deliver video", detail: errTxt.slice(-300) }); else res.end(); });
 }
 
 // ---------- AI chat through the Vercel AI Gateway (key stays on the server) ----------
