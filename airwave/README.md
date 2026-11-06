@@ -54,6 +54,12 @@ the app re-requests live streams automatically. Without a gateway key, chat fall
 ### Stream queue (v2.5)
 Starting a stream stops the old one, frees its buffers and waits ~320 ms; skipping quickly (Left/Right/Up/Down) collapses into one request.
 
+### Dictation and episode search (v2.5)
+**Voice:** Search menu (home) -> "Speak a search", or press **Left** in AI chat. Press A, speak, it stops when you pause; the relay transcribes it
+(`/stt`, Whisper through the Vercel AI Gateway, so `AI_GATEWAY_API_KEY` must be set on the relay) and you confirm what it heard before it is used.
+**Episodes:** Podcasts -> "Search episodes" finds episodes across every show; every episode list starts with "Search this show" (title filter over the
+newest part of the feed) and "Speak to search".
+
 ## Install
 Sideload `dist/Airwave.pdx.zip` at play.date/account/sideload (it has the device binary `pdex.bin` and the simulator library `pdex.so`). Allow internet access on first launch.
 

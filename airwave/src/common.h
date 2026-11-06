@@ -29,6 +29,7 @@ struct Req {
 	char loc[URL_MAX];     /* Location header of the last reply */
 	int redirects;
 	char* postBody; size_t postLen;        /* POST when set (kept for retries) */
+	char postType[40]; bool postBorrowed;  /* binary POST: the caller owns the body and keeps it alive until net_free */
 	/* buffered mode */
 	char* buf;
 	size_t len, cap, max;
@@ -48,6 +49,7 @@ struct Req {
 
 Req* net_get(const char* url, size_t maxBytes, ReqDone done, void* ud);
 Req* net_post(const char* url, const char* jsonBody, size_t maxBytes, ReqDone done, void* ud);
+Req* net_post_bin(const char* url, const void* data, size_t len, const char* type, size_t maxBytes, ReqDone done, void* ud);
 Req* net_stream(const char* url, size_t ringBytes);
 void net_update(void);                 /* call every frame */
 void net_free(Req* r);                 /* cancels if still running */

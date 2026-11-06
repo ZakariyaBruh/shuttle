@@ -249,6 +249,32 @@ async function chat(req, res) {
   res.end(await r.text());
 }
 
+// ---------- dictation: raw 16-bit mono PCM from the Playdate mic -> WAV -> AI Gateway transcription ----------
+async function stt(req, res, q) {
+  const key = process.env.AI_GATEWAY_API_KEY;
+  if (!key) return json(res, 501, { error: "Dictation needs the AI Gateway key set on the relay." });
+  const chunks = []; let n = 0;
+  for await (const c of req) { n += c.length; if (n > 1.5e6) return json(res, 413, { error: "That recording was too long." }); chunks.push(c); }
+  const pcm = Buffer.concat(chunks); const rate = Math.min(48000, Math.max(8000, Number(q.get("r")) || 11025));
+  const count = pcm.length >> 1;
+  if (count < rate * 0.3) return json(res, 200, { text: "" });
+  let peak = 1; for (let i = 0; i < count; i++) { const v = Math.abs(pcm.readInt16LE(i * 2)); if (v > peak) peak = v; }
+  const gain = Math.min(24, 24000 / peak);                                  // the mic is quiet: normalise before transcribing
+  const wav = Buffer.alloc(44 + count * 2);
+  wav.write("RIFF", 0); wav.writeUInt32LE(36 + count * 2, 4); wav.write("WAVEfmt ", 8); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
+  wav.writeUInt32LE(rate, 24); wav.writeUInt32LE(rate * 2, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write("data", 36); wav.writeUInt32LE(count * 2, 40);
+  for (let i = 0; i < count; i++) wav.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(pcm.readInt16LE(i * 2) * gain))), 44 + i * 2);
+  const r = await fetch("https://ai-gateway.vercel.sh/v4/ai/transcription-model", {
+    method: "POST", signal: AbortSignal.timeout(40000),
+    headers: { authorization: `Bearer ${key}`, "ai-gateway-protocol-version": "0.0.1", "ai-transcription-model-specification-version": "4", "ai-model-id": process.env.AI_STT_MODEL || "openai/whisper-1", "content-type": "application/json" },
+    body: JSON.stringify({ audio: wav.toString("base64"), mediaType: "audio/wav" }),
+  });
+  const t = await r.text();
+  if (!r.ok) return json(res, 502, { error: `Transcription failed (HTTP ${r.status}).`, detail: t.slice(0, 160) });
+  let text = ""; try { text = String(JSON.parse(t).text || "").trim(); } catch {}
+  return json(res, 200, { text });
+}
+
 // ---------- routing ----------
 const json = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { "content-type": "application/json", "content-length": Buffer.byteLength(b) }); res.end(b); };
 const page = (rows, off, params, base, per = 39) => {
@@ -265,6 +291,7 @@ module.exports = async (req, res) => {
     const p = u.pathname;
     if (p === "/health") return json(res, 200, { ok: true, version: "2.5", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no" });
     if (p === "/chat" && req.method === "POST") return await chat(req, res);
+    if (p === "/stt" && req.method === "POST") return await stt(req, res, q);
     if (p === "/t.mp3") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamMp3(await lowVariant(s), res); }
     if (p === "/v") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamVideo(await lowVariant(s), res, q.get("fit")); }
     let m = /^\/(free|pluto|ia|iptv)\/(audio|video)\/([\w.\-=]+?)(?:\.mp3)?$/.exec(p);

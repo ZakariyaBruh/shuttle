@@ -82,7 +82,8 @@ static bool connect_req(Req* r)
 	h->setConnectionClosedCallback(r->conn, on_closed);
 	PDNetErr e;
 	if (r->postBody) {
-		static const char* ph = "User-Agent: Airwave/1.0\r\nAccept: */*\r\nConnection: close\r\nContent-Type: application/json\r\n";
+		static char ph[200];
+		snprintf(ph, sizeof ph, "User-Agent: Airwave/1.0\r\nAccept: */*\r\nConnection: close\r\nContent-Type: %s\r\n", r->postType[0] ? r->postType : "application/json");
 		e = h->post(r->conn, path, ph, strlen(ph), r->postBody, r->postLen);
 	} else e = h->get(r->conn, path, UA, strlen(UA));
 	if (e != NET_OK) { snprintf(r->error, sizeof r->error, "request failed (%d)", e); return false; }
@@ -124,6 +125,21 @@ Req* net_post(const char* url, const char* jsonBody, size_t maxBytes, ReqDone do
 	return r;
 }
 
+Req* net_post_bin(const char* url, const void* data, size_t len, const char* type, size_t maxBytes, ReqDone done, void* ud)
+{
+	Req* r = pd->system->realloc(NULL, sizeof(Req));
+	if (!r) return NULL;
+	memset(r, 0, sizeof *r);
+	snprintf(r->url, sizeof r->url, "%s", url);
+	r->max = maxBytes; r->done = done; r->ud = ud;
+	r->postBody = (char*)data; r->postLen = len; r->postBorrowed = true;
+	snprintf(r->postType, sizeof r->postType, "%s", type);
+	r->cap = 4096; r->buf = xrealloc(NULL, r->cap);
+	if (!add_req(r)) return NULL;
+	if (!connect_req(r)) { r->status = -1; r->finished = true; }
+	return r;
+}
+
 Req* net_stream(const char* url, size_t ringBytes)
 {
 	Req* r = pd->system->realloc(NULL, sizeof(Req));
@@ -143,7 +159,7 @@ void net_free(Req* r)
 	drop_conn(r);
 	if (r->buf) xrealloc(r->buf, 0);
 	ring_free(&r->ring);
-	if (r->postBody) xrealloc(r->postBody, 0);
+	if (r->postBody && !r->postBorrowed) xrealloc(r->postBody, 0);
 	xrealloc(r, 0);
 }
 

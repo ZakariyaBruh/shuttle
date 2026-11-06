@@ -29,9 +29,12 @@ PlaydateAPI* pd;
 #define ENC_MAX (URL_MAX * 3)
 #define VERSION "2.5"
 
-typedef enum { M_SPLASH, M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT } Mode;
+typedef enum { M_SPLASH, M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT, M_VOICE } Mode;
 typedef void (*Parser)(Req* r);
 static void start_playback_hook(const char* title, const char* arg);
+static void voice_open(const char* dest);
+static void submit_text(void);
+static char epFeedUrl[560], epFilter[40];       /* the show whose episodes are listed, and the title filter for "search this show" */
 
 static List* stack[8];
 static int depth;
@@ -117,8 +120,7 @@ static void show_msg(const char* fmt, const char* a)
 static void need_relay(const char* what)
 {
 	static char t[400];
-	snprintf(t, sizeof t, "%s needs a small helper server (the relay) to convert it for the Playdate. "
-		"Radio, podcasts, TuneIn, the Library and AI Chat all work without it.", what);
+	snprintf(t, sizeof t, "%s needs the relay, a small helper server. Radio, podcasts, TuneIn, the Library and AI Chat work without it.", what);
 	show_card(IC_LOCK, "Needs the relay", t, 1);
 }
 
@@ -191,6 +193,7 @@ bool item_locked(const Item* it)
 	switch (it->kind) {
 		case K_RELAY_LIST: case K_PLAY_VIDEO: return true;
 		case K_PLAY: return !strncmp(it->arg, "relay:", 6);
+		case K_SPEAK: return true;                                       /* dictation is transcribed by the relay */
 		case K_MENU: for (int i = 0; i < 7; i++) if (!strcmp(it->arg, relayMenus[i])) return true; return false;
 		case K_SEARCH: case K_SEARCH_IN: for (int i = 0; i < 5; i++) if (!strcmp(it->arg, relaySearch[i])) return true; return false;
 		default: return false;
@@ -201,6 +204,7 @@ IconId item_icon(const Item* it)
 {
 	switch (it->kind) {
 		case K_SEARCH: case K_SEARCH_ALL: case K_SEARCH_IN: return IC_SEARCH;
+		case K_SPEAK: return IC_MIC;
 		case K_PLAY_VIDEO: return IC_VIDEO;
 		case K_PLAY: case K_TUNEIN_PLAY: case K_RADIO_Q: return IC_RADIO;
 		case K_POD_CHARTS: case K_POD_GENRES: case K_POD_GENRE: case K_POD_ID: case K_POD_FEED: return IC_POD;
@@ -233,8 +237,9 @@ static void load_settings(void)
 	if (n <= 0) return;
 	buf[n] = 0;
 	Span s = { buf, (size_t)n };
-	json_get_str(s, "relay", relayHost, sizeof relayHost);
-	json_get_str(s, "relay_token", relayToken, sizeof relayToken);
+	static char tmp[128];                                          /* an empty saved value must not wipe the built-in defaults */
+	if (json_get_str(s, "relay", tmp, sizeof tmp) && tmp[0]) snprintf(relayHost, sizeof relayHost, "%s", tmp);
+	if (json_get_str(s, "relay_token", tmp, sizeof tmp) && tmp[0]) snprintf(relayToken, sizeof relayToken, "%s", tmp);
 	debugOn = strstr(buf, "\"debug\": true") || strstr(buf, "\"debug\":true");
 }
 
@@ -268,6 +273,7 @@ static void open_menu(const char* id)
 		list_add2(l, "BBC World Service", "Live news, plays instantly", K_PLAY, BBC_WS);
 		list_add2(l, "Top stations", "Most popular worldwide", K_RADIO_Q, "");
 		list_add2(l, "Search stations", "By name", K_SEARCH, "radio");
+		list_add2(l, "Speak to search", "Say a station name", K_SPEAK, "radio");
 		const char* tags[][3] = { {"Jazz","jazz","Smooth to bebop"}, {"Classical","classical","Orchestras and chamber"}, {"News","news","Headlines and talk"},
 			{"Rock","rock","Guitars up"}, {"Pop","pop","Chart hits"}, {"Electronic","electronic","Beats and ambient"}, {"Chillout","chillout","Calm and downtempo"},
 			{"Talk","talk","Conversation radio"}, {"Country","country","Nashville and beyond"}, {"Hip hop","hiphop","Rap and beats"},
@@ -291,6 +297,14 @@ static void open_menu(const char* id)
 		list_add2(l, "Top charts", "What everyone is listening to", K_POD_CHARTS, "");
 		list_add2(l, "Categories", "Comedy, true crime, news...", K_MENU, "podgenres");
 		list_add2(l, "Search podcasts", "By show name", K_SEARCH, "pod");
+		list_add2(l, "Search episodes", "Find an episode by title", K_SEARCH, "ep");
+		list_add2(l, "Speak to search", "Say a show or episode", K_SPEAK, "ep");
+	} else if (!strcmp(id, "search")) {
+		l = list_new("Search");
+		list_add2(l, "Type a search", "Radio, podcasts, TV, library...", K_SEARCH_ALL, "");
+		list_add2(l, "Speak a search", "Say what you want", K_SPEAK, "all");
+		list_add2(l, "Search episodes", "Podcast episodes by title", K_SEARCH, "ep");
+		list_add2(l, "Speak an episode search", "Say an episode title", K_SPEAK, "ep");
 	} else if (!strcmp(id, "podgenres")) {
 		l = list_new("Categories");
 		for (size_t i = 0; i < sizeof POD_GENRES / sizeof POD_GENRES[0]; i++) list_add2(l, POD_GENRES[i].name, "Top 20 shows", K_POD_GENRE, POD_GENRES[i].id);
@@ -452,26 +466,64 @@ static void parse_search(Req* r)
 	push(l);
 }
 
+static bool ci_contains(const char* h, const char* n)
+{
+	size_t nl = strlen(n);
+	for (; *h; h++) if (!strncasecmp(h, n, nl)) return true;
+	return false;
+}
+
 static void parse_episodes(Req* r)
 {
 	List* l = list_new(pendingTitle);
 	const char* cur = r->buf; Span item;
-	int skipped = 0;
+	int skipped = 0, eps = 0;
+	bool filt = epFilter[0] != 0;
+	if (!filt) {                                                       /* a search bar on top of every episode list */
+		list_add2(l, "Search this show", "Find an episode by title", K_SEARCH, "epfeed");
+		list_add2(l, "Speak to search", "Say part of the title", K_SPEAK, "epfeed");
+	}
 	while (l->n < MAX_ITEMS && rss_next_item(&cur, &item)) {
 		static char url[1000], title[96], arg[1100], date[40]; bool mp3;
 		if (!rss_enclosure(item, url, sizeof url, &mp3)) continue;
 		if (!mp3 && !relayHost[0]) { skipped++; continue; }
 		if (!rss_tag_text(item, "title", title, sizeof title)) snprintf(title, sizeof title, "Episode");
+		if (filt && !ci_contains(title, epFilter)) continue;
 		if (!rss_tag_text(item, "pubDate", date, sizeof date)) date[0] = 0;
 		if (strlen(date) > 16) date[16] = 0;
 		if (mp3) snprintf(arg, sizeof arg, "%s", url); else via_relay(arg, sizeof arg, url);
 		list_add2(l, title, date, K_PLAY, arg);
+		eps++;
 	}
-	if (!l->n) {
+	epFilter[0] = 0;
+	if (!eps) {
 		list_free(l);
-		show_msg(skipped ? "This show only has AAC/M4A episodes, which the Playdate can't play (the relay can convert them)." : "No episodes found.", NULL);
+		show_msg(filt ? "No episode in the latest part of this feed matches that." : skipped ? "This show only has AAC/M4A episodes, which the Playdate can't play (the relay can convert them)." : "No episodes found.", NULL);
 		return;
 	}
+	push(l);
+}
+
+/* iTunes episode search: every podcast at once */
+static void parse_ep_search(Req* r)
+{
+	const char* arr = json_array_start(r->buf, "results");
+	List* l = list_new(pendingTitle);
+	const char* cur = arr; Span o;
+	while (arr && l->n < MAX_ITEMS && json_next_object(&cur, r->buf + r->len, &o)) {
+		static char name[96], show[56], url[700], ext[8], arg[1100];
+		json_get_str(o, "trackName", name, sizeof name);
+		json_get_str(o, "collectionName", show, sizeof show);
+		json_get_str(o, "episodeUrl", url, sizeof url);
+		json_get_str(o, "episodeFileExtension", ext, sizeof ext);
+		if (!name[0] || !url[0]) continue;
+		bool mp3 = !strcasecmp(ext, "mp3") || strstr(url, ".mp3");
+		if (mp3) snprintf(arg, sizeof arg, "%s", url);
+		else if (relayHost[0]) via_relay(arg, sizeof arg, url);
+		else continue;
+		list_add2(l, name, show, K_PLAY, arg);
+	}
+	if (!l->n) { list_free(l); show_msg("No episodes found for that.", NULL); return; }
 	push(l);
 }
 
@@ -481,6 +533,7 @@ static void parse_lookup(Req* r)
 	const char* cur = arr; Span o; static char feed[560]; feed[0] = 0;
 	if (arr && json_next_object(&cur, r->buf + r->len, &o)) json_get_str(o, "feedUrl", feed, sizeof feed);
 	if (!feed[0]) { show_msg("No feed URL for this podcast.", NULL); return; }
+	snprintf(epFeedUrl, sizeof epFeedUrl, "%s", feed); epFilter[0] = 0;
 	char title[40]; snprintf(title, sizeof title, "%s", pendingTitle);
 	start_fetch(feed, 320 * 1024, parse_episodes, title);
 }
@@ -1051,6 +1104,14 @@ static void run_search(const char* source, const char* query)
 		start_fetch(url, 96 * 1024, parse_tunein, query);
 	} else if (!strcmp(source, "lib")) {
 		ia_query(query, query);
+	} else if (!strcmp(source, "ep")) {
+		snprintf(url, sizeof url, "https://itunes.apple.com/search?media=podcast&entity=podcastEpisode&limit=30&term=%s", enc);
+		start_fetch(url, 200 * 1024, parse_ep_search, query);
+	} else if (!strcmp(source, "epfeed")) {
+		if (!epFeedUrl[0]) { show_msg("Open a show first.", NULL); return; }
+		snprintf(epFilter, sizeof epFilter, "%s", query);
+		static char ft[40]; snprintf(ft, sizeof ft, "%s", query);
+		start_fetch(epFeedUrl, 320 * 1024, parse_episodes, ft);
 	} else {
 		if (!relayHost[0]) { need_relay("Searching here"); return; }
 		const char* route = !strcmp(source, "yt") ? "/yt/search?q=%s" : !strcmp(source, "ia") ? "/ia/search?q=%s" :
@@ -1108,7 +1169,7 @@ static void home_open(int idx)
 		case 4: if (!relayHost[0]) need_relay("TV"); else open_menu("tv"); break;
 		case 5: if (!relayHost[0]) need_relay("YouTube"); else open_menu("yt"); break;
 		case 6: if (!chatN) chat_add(false, "Hi! I'm Airwave's assistant. Press A to type a question."); mode = M_CHAT; chatStick = true; break;
-		case 7: open_text("all", 27); break;
+		case 7: open_menu("search"); break;
 		default: open_setup(); break;
 	}
 }
@@ -1124,6 +1185,7 @@ static void activate(Item* it, bool altAction)
 			start_fetch(url, 160 * 1024, parse_radio, it->label); break;
 		case K_SEARCH: open_text(it->arg, 27); break;
 		case K_SEARCH_ALL: open_text("all", 27); break;
+		case K_SPEAK: voice_open(it->arg); break;
 		case K_SEARCH_IN: run_search(it->arg, searchQuery); break;
 		case K_POD_CHARTS: start_fetch(APPLE_CHARTS, 96 * 1024, parse_charts, "Top podcasts"); break;
 		case K_POD_GENRE:
@@ -1132,7 +1194,7 @@ static void activate(Item* it, bool altAction)
 		case K_POD_ID:
 			snprintf(url, sizeof url, "https://itunes.apple.com/lookup?id=%s", it->arg);
 			start_fetch(url, 64 * 1024, parse_lookup, it->label); break;
-		case K_POD_FEED: start_fetch(it->arg, 320 * 1024, parse_episodes, it->label); break;
+		case K_POD_FEED: snprintf(epFeedUrl, sizeof epFeedUrl, "%s", it->arg); epFilter[0] = 0; start_fetch(it->arg, 320 * 1024, parse_episodes, it->label); break;
 		case K_RELAY_LIST: {
 			char title[40];
 			if (strstr(it->arg, "offset=") || strstr(it->arg, "page=")) { snprintf(title, sizeof title, "%s", stack[depth - 1]->title); if (depth > 1) pop(); }   /* "More..." replaces the page */
@@ -1188,6 +1250,175 @@ static void surf(int dir)
 	activate(&playList->items[i], false);
 }
 
+/* ---------- dictation: the microphone, sent to the relay, which transcribes it ---------- */
+
+#define MIC_RATE 11025                                   /* 44.1 kHz from the mic, averaged down by 4 */
+#define MIC_MAX_SEC 10
+typedef enum { V_READY, V_REC, V_SEND, V_HEARD } VState;
+static VState vState;
+static char voiceDest[16];                               /* which search/chat the words go to ("all" "ep" "epfeed" "radio" "chat"...) */
+static Mode voiceBack = M_HOME;
+static int16_t* micBuf;
+static uint32_t micCap;
+static volatile uint32_t micLen, micQuiet;
+static volatile int micOn, micPeak, micMax, micSpeech;
+static Req* sttReq;
+static char heard[104], voiceErr[120];
+static uint32_t voiceT0;
+
+static int mic_cb(void* ud, int16_t* d, int n)           /* runs on the audio thread */
+{
+	(void)ud;
+	if (!micOn || !micBuf) return 0;
+	static int32_t acc; static int cnt;
+	int pk = 0;
+	for (int i = 0; i < n; i++) {
+		int v = d[i], a = v < 0 ? -v : v;
+		if (a > pk) pk = a;
+		acc += v;
+		if (++cnt == 4) { if (micLen < micCap) micBuf[micLen++] = (int16_t)(acc / 4); acc = 0; cnt = 0; }
+	}
+	micPeak = pk;
+	if (pk > micMax) micMax = pk;
+	int thr = micMax / 8 > 900 ? micMax / 8 : 900;
+	if (pk > thr) { micSpeech = 1; micQuiet = 0; } else micQuiet += (uint32_t)n;
+	if (micLen >= micCap) micOn = 0;
+	return 1;
+}
+
+static void voice_release(void)
+{
+	micOn = 0;
+	pd->sound->setMicCallback(NULL, NULL, kMicInputAutodetect);
+	if (sttReq) { net_free(sttReq); sttReq = NULL; }           /* before the buffer: the request borrows it */
+	if (micBuf) { xfree(micBuf); micBuf = NULL; }
+}
+
+static void voice_open(const char* dest)
+{
+	if (!relayHost[0]) { need_relay("Dictation"); return; }
+	stop_playback();
+	voice_release();
+	snprintf(voiceDest, sizeof voiceDest, "%s", dest);
+	voiceBack = mode;
+	vState = V_READY; heard[0] = 0; voiceErr[0] = 0;
+	mode = M_VOICE;
+}
+
+static void voice_close(void) { voice_release(); mode = voiceBack; }
+
+static void voice_start(void)
+{
+	voice_release();
+	micCap = MIC_RATE * MIC_MAX_SEC;
+	micBuf = xalloc(micCap * sizeof(int16_t));
+	if (!micBuf) { voiceErr[0] = 0; snprintf(voiceErr, sizeof voiceErr, "Out of memory"); vState = V_HEARD; heard[0] = 0; return; }
+	micLen = 0; micQuiet = 0; micPeak = micMax = micSpeech = 0;
+	micOn = 1; vState = V_REC; voiceT0 = now_ms(); heard[0] = 0; voiceErr[0] = 0;
+	pd->sound->setMicCallback(mic_cb, NULL, kMicInputAutodetect);
+}
+
+static void voice_stop_and_send(void)
+{
+	micOn = 0;
+	pd->sound->setMicCallback(NULL, NULL, kMicInputAutodetect);
+	if (micLen < MIC_RATE / 3) { voice_release(); heard[0] = 0; snprintf(voiceErr, sizeof voiceErr, "That was too short."); vState = V_HEARD; return; }
+	static char url[500];
+	relay_url(url, sizeof url, "/stt?r=" "11025");
+	sttReq = net_post_bin(url, micBuf, micLen * sizeof(int16_t), "application/octet-stream", 8 * 1024, on_fetched, NULL);
+	dbg("stt: %u samples sent", (unsigned)micLen);
+	if (!sttReq) { voice_release(); heard[0] = 0; snprintf(voiceErr, sizeof voiceErr, "Out of memory"); vState = V_HEARD; return; }
+	vState = V_SEND;
+}
+
+static void voice_tick(void)
+{
+	if (vState == V_REC) {
+		uint32_t el = now_ms() - voiceT0;
+		if (micLen == 0 && el > 1800) {                                 /* the callback never delivered anything */
+			voice_release(); heard[0] = 0; snprintf(voiceErr, sizeof voiceErr, "No sound from the microphone. Check that it isn't blocked.");
+			vState = V_HEARD;
+		} else if (!micOn || el > (MIC_MAX_SEC + 2) * 1000u || (micSpeech && micQuiet > 44100u * 14 / 10) || (!micSpeech && micQuiet > 44100u * 7)) voice_stop_and_send();
+	}
+	if (vState == V_SEND && sttReq && sttReq->finished) {
+		Req* r = sttReq;
+		heard[0] = 0; voiceErr[0] = 0;
+		Span o = { r->buf, r->len };
+		static char tmp[300];
+		if (r->status >= 200 && r->status < 300 && r->len) {
+			json_get_text(o, "text", tmp, sizeof tmp);
+			copy_ascii(heard, sizeof heard, tmp);
+			char* p = heard; while (*p == ' ') p++;
+			if (p != heard) memmove(heard, p, strlen(p) + 1);
+			size_t n = strlen(heard); while (n && heard[n - 1] == ' ') heard[--n] = 0;
+			if (!heard[0]) snprintf(voiceErr, sizeof voiceErr, "I didn't catch that. Try again, a little closer.");
+		} else {
+			if (r->len) json_get_str(o, "error", tmp, sizeof tmp); else tmp[0] = 0;
+			copy_ascii(voiceErr, sizeof voiceErr, tmp[0] ? tmp : r->error[0] ? r->error : "Couldn't reach the relay.");
+		}
+		dbg("stt: status %d -> '%s' / '%s'", r->status, heard, voiceErr);
+		voice_release();
+		vState = V_HEARD;
+	}
+}
+
+static void voice_use(void)
+{
+	snprintf(textSource, sizeof textSource, "%s", voiceDest);
+	snprintf(textBuf, sizeof textBuf, "%s", heard);
+	textLen = (int)strlen(textBuf);
+	mode = voiceBack;
+	if (!strcmp(voiceDest, "chat")) { static char t[128]; snprintf(t, sizeof t, "%s", heard); mode = M_CHAT; chat_send(t); }
+	else submit_text();
+}
+
+static void draw_voice(void)
+{
+	const struct playdate_graphics* G = pd->graphics;
+	ui_header("Voice", "");
+	int cx = viewW / 2;
+	if (vState == V_HEARD) {
+		if (heard[0]) {
+			Tmc(fSmall, "I HEARD", cx, 62, kDrawModeFillBlack);
+			G->drawRoundRect(14, 76, viewW - 28, 94, 12, 3, kColorBlack);
+			ui_wrap(heard, 28, 102, viewW - 56, 3, fBody, 23, kDrawModeFillBlack);
+			ui_hints("A Use it|UD Speak again|B Discard");
+		} else {
+			ui_card(IC_INFO, "Dictation", voiceErr[0] ? voiceErr : "Nothing came back.");
+			ui_hints("UD Try again|B Back");
+		}
+		return;
+	}
+	int lvl = vState == V_REC ? micPeak * 34 / 9000 : 0;
+	if (lvl > 34) lvl = 34;
+	int r = 44 + lvl;
+	G->drawEllipse(cx - r, 98 - r, 2 * r, 2 * r, 2, 0, 0, kColorBlack);
+	G->drawEllipse(cx - 44, 98 - 44, 88, 88, 3, 0, 0, kColorBlack);
+	ui_icon(IC_MIC, cx, 98, 54, kColorBlack);
+	char t[48];
+	switch (vState) {
+		case V_READY:
+			Tmc(fBold, "Press A, then speak", cx, 168, kDrawModeFillBlack);
+			Tmc(fSmall, "It stops by itself when you pause", cx, 190, kDrawModeFillBlack);
+			ui_hints("A Start|B Back");
+			break;
+		case V_REC: {
+			int secs = (int)((now_ms() - voiceT0) / 1000);
+			snprintf(t, sizeof t, "Listening...  %d s", secs);
+			Tmc(fBold, t, cx, 168, kDrawModeFillBlack);
+			G->drawRoundRect(cx - 80, 184, 160, 10, 5, 2, kColorBlack);
+			int w = (int)(micLen * 156 / micCap); if (w > 2) G->fillRoundRect(cx - 78, 186, w, 6, 3, kColorBlack);
+			ui_hints("A Done|B Cancel");
+			break;
+		}
+		default:
+			ui_spinner(cx - 62, 168, 9);
+			Tmc(fBold, "Transcribing...", cx + 8, 168, kDrawModeFillBlack);
+			ui_hints("B Cancel");
+			break;
+	}
+}
+
 static void submit_text(void)
 {
 	if (textLen == 0 && strcmp(textSource, "relay") && strcmp(textSource, "token")) { mode = depth ? M_LIST : M_HOME; return; }
@@ -1218,6 +1449,7 @@ static void submit_text(void)
 	List* l = list_new(title);
 	list_add2(l, "Radio stations", "Worldwide directory", K_SEARCH_IN, "radio");
 	list_add2(l, "Podcasts", "Apple podcasts", K_SEARCH_IN, "pod");
+	list_add2(l, "Podcast episodes", "By episode title", K_SEARCH_IN, "ep");
 	list_add2(l, "TuneIn", "Stations and shows", K_SEARCH_IN, "tunein");
 	list_add2(l, "Library", "Audiobooks and old radio", K_SEARCH_IN, "lib");
 	if (relayHost[0]) {
@@ -1274,8 +1506,9 @@ static const char* search_title(void)
 {
 	static const char* titles[][2] = { {"radio","Search radio"}, {"pod","Search podcasts"}, {"tunein","Search TuneIn"}, {"lib","Search the library"},
 		{"iptv","Search IPTV"}, {"yt","Search YouTube"}, {"ia","Search classic TV"}, {"all","Search everything"}, {"chat","Message the AI"},
-		{"pluto","Search live channels"}, {"shorts","Search Shorts"}, {"relay","Relay address"}, {"token","Relay token"} };
-	for (int i = 0; i < 13; i++) if (!strcmp(titles[i][0], textSource)) return titles[i][1];
+		{"pluto","Search live channels"}, {"shorts","Search Shorts"}, {"relay","Relay address"}, {"token","Relay token"},
+		{"ep","Search episodes"}, {"epfeed","Search this show"} };
+	for (int i = 0; i < (int)(sizeof titles / sizeof titles[0]); i++) if (!strcmp(titles[i][0], textSource)) return titles[i][1];
 	return "Search";
 }
 
@@ -1354,7 +1587,7 @@ static void draw_chat(void)
 		pd->graphics->drawRoundRect(8, 166, viewW - 16, 48, 10, 3, kColorBlack);
 		if (textLen == 0) ui_wrap("Type with the keyboard...", 20, 190, viewW - 44, 2, fBody, 18, kDrawModeFillBlack);
 		else draw_typed(20, 182, viewW - 44, 2, 19);
-	} else ui_hints("A Write|UD Scroll|B Back");
+	} else ui_hints(relayHost[0] ? "A Write|L Speak|UD Scroll|B Back" : "A Write|UD Scroll|B Back");
 }
 
 /* ---------- splash animation and page transitions ---------- */
@@ -1595,9 +1828,22 @@ static void app_update(int left, bool keyboardOn)
 			if (pushed & kButtonDown) chatScroll += 36;
 			if (pushed & kButtonUp) chatScroll -= 36;
 			if ((pushed & kButtonA) && !chatReq && !kbActive) open_text("chat", 110);
+			if ((pushed & kButtonLeft) && !chatReq && !kbActive) voice_open("chat");
 			if ((pushed & kButtonB) && !kbActive) mode = depth ? M_LIST : M_HOME;
 			break;
 		}
+		case M_VOICE:
+			voice_tick();
+			draw_voice();
+			if (vState == V_READY) { if (pushed & kButtonA) voice_start(); else if (pushed & kButtonB) voice_close(); }
+			else if (vState == V_REC) { if (pushed & kButtonA) voice_stop_and_send(); else if (pushed & kButtonB) voice_close(); }
+			else if (vState == V_SEND) { if (pushed & kButtonB) voice_close(); }
+			else {
+				if ((pushed & kButtonA) && heard[0]) voice_use();
+				else if (pushed & (kButtonUp | kButtonDown)) voice_start();
+				else if (pushed & kButtonB) voice_close();
+			}
+			break;
 		case M_VIDEO: {
 			bool dead = stream && stream->status < 0 && vqCount == 0;
 			if (dead && !vGotFrame && !videoFellBack && strstr(playArg, "/video/")) {      /* no picture at all (audio-only channel?): fall back to audio */

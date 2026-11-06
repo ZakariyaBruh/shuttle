@@ -188,6 +188,12 @@ void ui_icon(IconId ic, int cx, int cy, int size, LCDColor c)
 			for (int i = 1; i <= 3; i++) { int r = i * 8; G->drawEllipse(X(22 - r), Y(30 - r), L(r * 2), L(r * 2), L(3), 300, 420, c); }
 			G->fillEllipse(X(19), Y(31), L(7), L(7), 0, 0, c);
 			break;
+		case IC_MIC:
+			G->fillRoundRect(X(15), Y(2), L(14), L(23), L(7), c);
+			G->drawEllipse(X(8), Y(11), L(28), L(24), L(3), 90, 270, c);
+			G->drawLine(X(22), Y(34), X(22), Y(40), L(3), c);
+			G->drawLine(X(13), Y(41), X(31), Y(41), L(3), c);
+			break;
 		case IC_CHECK:
 			G->drawLine(X(8), Y(24), X(18), Y(34), L(5), c);
 			G->drawLine(X(18), Y(34), X(37), Y(10), L(5), c);
@@ -257,6 +263,8 @@ static void glyph(const char* g, int x, int cy)                  /* 16x16, centr
 	} else if (!strcmp(g, "LR")) {
 		G->fillTriangle(x, y + 8, x + 6, y + 2, x + 6, y + 14, kColorBlack);
 		G->fillTriangle(x + 15, y + 8, x + 9, y + 2, x + 9, y + 14, kColorBlack);
+	} else if (!strcmp(g, "L")) {
+		G->fillTriangle(x + 1, y + 8, x + 11, y + 1, x + 11, y + 15, kColorBlack);
 	} else if (!strcmp(g, "C")) {                                   /* crank */
 		G->drawEllipse(x + 1, y + 4, 11, 11, 2, 0, 0, kColorBlack);
 		G->drawLine(x + 11, y + 5, x + 15, y + 1, 2, kColorBlack);
