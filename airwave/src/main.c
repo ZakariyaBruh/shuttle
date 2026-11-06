@@ -27,7 +27,7 @@ PlaydateAPI* pd;
 #define VQ_BYTES (160 * 1024)          /* cap on queued compressed frames: back-pressure instead of memory growth */
 #define FRAME_BYTES (LCD_ROWSIZE * 240)
 #define ENC_MAX (URL_MAX * 3)
-#define VERSION "2.8"
+#define VERSION "2.9"
 
 typedef enum { M_SPLASH, M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT, M_VOICE } Mode;
 typedef void (*Parser)(Req* r);
@@ -75,6 +75,26 @@ static char nowTitle[80], nowSub[56];
 /* ---------- helpers ---------- */
 
 static bool debugOn;
+static char lastStop[120];                          /* what the previous run was doing if it did not exit cleanly */
+static void crumb(const char* fmt, ...)
+{
+	static char line[100];
+	va_list ap; va_start(ap, fmt); vsnprintf(line, sizeof line, fmt, ap); va_end(ap);
+	SDFile* f = pd->file->open("stage.txt", kFileWrite);
+	if (!f) return;
+	pd->file->write(f, line, (unsigned)strlen(line));
+	pd->file->close(f);
+}
+static void crumb_boot(void)
+{
+	static char b[120];
+	SDFile* f = pd->file->open("stage.txt", kFileReadData);
+	if (f) {
+		int n = pd->file->read(f, b, sizeof b - 1); pd->file->close(f);
+		if (n > 0) { b[n] = 0; if (strncmp(b, "EXIT", 4)) snprintf(lastStop, sizeof lastStop, "%s", b); }
+	}
+	crumb("RUN start");
+}
 static void dbg(const char* fmt, ...)
 {
 	if (!debugOn) return;
@@ -153,8 +173,10 @@ static Item* list_add(List* l, const char* label, Kind k, const char* arg) { ret
 
 static void list_free(List* l) { if (l == &deadList) return; xfree(l->items); xfree(l); }
 
+static void crumb(const char* fmt, ...);
 static void push(List* l)
 {
+	crumb("push list '%.30s' n=%d depth=%d", l->title, l->n, depth);
 	if (depth < 8) stack[depth++] = l; else list_free(l);
 	mode = M_LIST;
 }
@@ -380,12 +402,34 @@ static void open_menu(const char* id)
 
 static void on_fetched(Req* r) { (void)r; /* handled in update() */ }
 
+static char pendingRaw[URL_MAX];                    /* the address as asked for, to retry directly if the relay can't fetch it */
+static size_t pendingMax;
+static bool pendingProxied, pendingRetried;
+
+static bool is_relay_url(const char* url)
+{
+	if (!relayHost[0]) return false;
+	const char* h = strncmp(relayHost, "http", 4) ? relayHost : strstr(relayHost, "://") + 3;
+	const char* u = strstr(url, "://");
+	return u && !strncmp(u + 3, h, strlen(h));
+}
+
 static void start_fetch(const char* url, size_t max, Parser p, const char* title)
 {
+	static char px[3200], full[URL_MAX], enc[ENC_MAX];
 	dbg("fetch %.100s", url);
 	if (pending) { net_free(pending); pending = NULL; }
 	snprintf(pendingTitle, sizeof pendingTitle, "%s", title);
 	pendingParser = p;
+	snprintf(pendingRaw, sizeof pendingRaw, "%s", url); pendingMax = max; pendingRetried = false;
+	pendingProxied = relayHost[0] && !is_relay_url(url);          /* big answers from other servers come through the relay, which hands them over in small pieces */
+	if (pendingProxied) {
+		urlenc(url, enc, sizeof enc);
+		snprintf(px, sizeof px, "/p?u=%s&m=%u", enc, (unsigned)max);
+		relay_url(full, sizeof full, px);
+		url = full;
+	}
+	crumb("fetch %s%.60s", pendingProxied ? "(relay) " : "", pendingRaw);
 	pending = net_get(url, max, on_fetched, NULL);
 	mode = M_LOADING;
 	if (!pending) show_msg("Out of memory", NULL);
@@ -688,6 +732,9 @@ static void parse_ia_files(Req* r)
 	push(l);
 }
 
+static bool relayChecked, relayYt = true;
+static Req* healthReq;
+
 static void parse_health(Req* r)
 {
 	Span o = { r->buf, r->len };
@@ -750,6 +797,7 @@ static int resumeCount;
 
 static void start_playback(const char* title, const char* arg, bool video)
 {
+	crumb("play %s %.70s", video ? "video" : "audio", arg);
 	static char url[URL_MAX];
 	stop_playback();
 	snprintf(playTitle, sizeof playTitle, "%s", title);
@@ -1167,7 +1215,11 @@ static void home_open(int idx)
 		case 2: open_menu("pod"); break;
 		case 3: open_menu("library"); break;
 		case 4: if (!relayHost[0]) need_relay("TV"); else open_menu("tv"); break;
-		case 5: if (!relayHost[0]) need_relay("YouTube"); else open_menu("yt"); break;
+		case 5:
+			if (!relayHost[0]) need_relay("YouTube");
+			else if (relayChecked && !relayYt) show_card(IC_YT, "YouTube", "This relay runs in the cloud, and YouTube blocks cloud servers. YouTube works with the home relay (relay.py on your own Wi-Fi). TV has Pluto, IPTV and classic films.", 0);
+			else open_menu("yt");
+			break;
 		case 6: if (!chatN) chat_add(false, "Hi! I'm Airwave's assistant. Press A to type a question."); mode = M_CHAT; chatStick = true; break;
 		case 7: open_menu("search"); break;
 		default: open_setup(); break;
@@ -1197,10 +1249,12 @@ static void activate(Item* it, bool altAction)
 		case K_POD_FEED: snprintf(epFeedUrl, sizeof epFeedUrl, "%s", it->arg); epFilter[0] = 0; start_fetch(it->arg, 320 * 1024, parse_episodes, it->label); break;
 		case K_RELAY_LIST: {
 			char title[40];
-			if (strstr(it->arg, "offset=") || strstr(it->arg, "page=")) { snprintf(title, sizeof title, "%s", stack[depth - 1]->title); if (depth > 1) pop(); }   /* "More..." replaces the page */
+			static char path[1100];
+			snprintf(path, sizeof path, "%s", it->arg);                       /* copy first: popping frees the list the item lives in */
+			if (strstr(path, "offset=") || strstr(path, "page=")) { snprintf(title, sizeof title, "%s", stack[depth - 1]->title); if (depth > 1) pop(); }   /* "More..." replaces the page */
 			else snprintf(title, sizeof title, "%s", it->label);
-			relay_url(url, sizeof url, it->arg);
-			start_fetch(url, 96 * 1024, parse_relay_list, title); break;
+			relay_url(url, sizeof url, path);
+			start_fetch(url, 32 * 1024, parse_relay_list, title); break;
 		}
 		case K_PLAY: playList = depth ? stack[depth - 1] : NULL; snprintf(playSub, sizeof playSub, "%s", it->sub); triedRelay = false; resumeCount = 0; request_play(it->label, it->arg, false); break;
 		case K_PLAY_VIDEO:
@@ -1454,8 +1508,10 @@ static void submit_text(void)
 	list_add2(l, "Library", "Audiobooks and old radio", K_SEARCH_IN, "lib");
 	if (relayHost[0]) {
 		list_add2(l, "Live TV channels", "Pluto TV", K_SEARCH_IN, "pluto");
-		list_add2(l, "YouTube", "Videos and episodes", K_SEARCH_IN, "yt");
-		list_add2(l, "YouTube Shorts", "Short clips", K_SEARCH_IN, "shorts");
+		if (relayYt) {
+			list_add2(l, "YouTube", "Videos and episodes", K_SEARCH_IN, "yt");
+			list_add2(l, "YouTube Shorts", "Short clips", K_SEARCH_IN, "shorts");
+		}
 		list_add2(l, "Classic TV and films", "Internet Archive", K_SEARCH_IN, "ia");
 		list_add2(l, "IPTV channels", "Free worldwide channels", K_SEARCH_IN, "iptv");
 	}
@@ -1733,7 +1789,14 @@ static void app_update(int left, bool keyboardOn)
 		uint32_t t = now - splashT0;
 		if ((pushed & (kButtonA | kButtonB)) && t > 700 && t < 2600) { splashT0 = now - 2600; t = 2600; }     /* skip */
 		draw_splash(t);
-		if (t >= 2980) { mode = netAllowed ? M_HOME : M_LOADING; fadeInT0 = now; }
+		if (t >= 2980) {
+			mode = netAllowed ? M_HOME : M_LOADING; fadeInT0 = now;
+			if (lastStop[0]) {                                        /* the previous run ended unexpectedly: say where */
+				static char m[200]; snprintf(m, sizeof m, "It stopped while: %s", lastStop);
+				show_card(IC_INFO, "Last time it stopped", m, 0);
+				lastStop[0] = 0;
+			}
+		}
 		return;
 	}
 	if (trans.active) pushed = 0;                                 /* no input while sliding */
@@ -1756,6 +1819,16 @@ static void app_update(int left, bool keyboardOn)
 	if (netAllowed && mode == M_LOADING && !pending && !depth) mode = M_HOME;
 
 	net_update();
+	if (netAllowed && relayHost[0] && !healthReq && !relayChecked) {      /* quietly learn what the relay can do (YouTube needs a home relay) */
+		static char hu[400];
+		healthReq = net_get(relay_url(hu, sizeof hu, "/health"), 2048, on_fetched, NULL);
+		if (!healthReq) relayChecked = true;
+	}
+	if (healthReq && healthReq->finished) {
+		Req* h = healthReq; healthReq = NULL; relayChecked = true;
+		if (h->status >= 200 && h->status < 300 && h->len) { Span o = { h->buf, h->len }; static char yv[8]; if (json_get_str(o, "yt", yv, sizeof yv)) relayYt = !strcmp(yv, "yes"); }
+		net_free(h);
+	}
 	maybe_fall_back();
 	chat_poll();
 
@@ -1763,10 +1836,20 @@ static void app_update(int left, bool keyboardOn)
 	if (pending && pending->finished) {
 		Req* r = pending; pending = NULL;
 		Parser p = pendingParser;
-		if (r->status < 0 || r->status >= 400) load_error(r);
-		else if (r->len == 0) show_msg("The server sent nothing.", NULL);
-		else p(r);
-		net_free(r);
+		crumb("got status %d, %u bytes", r->status, (unsigned)r->len);
+		if (pendingProxied && !pendingRetried && (r->status < 0 || r->status >= 400 || r->len == 0)) {      /* the relay couldn't get it: try the source directly */
+			net_free(r);
+			pendingProxied = false; pendingRetried = true;
+			crumb("retry direct");
+			pending = net_get(pendingRaw, pendingMax, on_fetched, NULL);
+			if (!pending) show_msg("Out of memory", NULL);
+		} else {
+			if (r->status < 0 || r->status >= 400) load_error(r);
+			else if (r->len == 0) show_msg("The server sent nothing.", NULL);
+			else { crumb("parse %u bytes", (unsigned)r->len); p(r); crumb("parsed, depth %d", depth); }
+			net_free(r);
+			crumb("idle");
+		}
 	}
 
 	play_queue_tick(now_ms());
@@ -1961,6 +2044,7 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 	(void)arg;
 	if (event == kEventInit) {
 		pd = playdate;
+		crumb_boot();
 		ui_load_fonts();
 		load_splash_art();
 		oldBmp = pd->graphics->newBitmap(400, 240, kColorWhite);
@@ -1977,6 +2061,7 @@ int eventHandler(PlaydateAPI* playdate, PDSystemEvent event, uint32_t arg)
 		if (!pd->lua->addFunction(l_kbText, "airwave.kbText", &err)) pd->system->logToConsole("addFunction kbText: %s", err);
 		if (!pd->lua->addFunction(l_kbDone, "airwave.kbDone", &err)) pd->system->logToConsole("addFunction kbDone: %s", err);
 	} else if (event == kEventTerminate) {
+		crumb("EXIT");
 		stop_playback();
 	}
 	return 0;

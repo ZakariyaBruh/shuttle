@@ -98,13 +98,22 @@ static Req* add_req(Req* r)
 	return NULL;
 }
 
+/* The whole response buffer is allocated once, at its limit, so nothing is reallocated while data arrives (falls back to growing). */
+static void alloc_body(Req* r)
+{
+	r->cap = r->max > 0 && r->max <= 400 * 1024 ? r->max + 1 : 4096;
+	r->buf = xrealloc(NULL, r->cap);
+	if (!r->buf && r->cap > 4096) { r->cap = 4096; r->buf = xrealloc(NULL, r->cap); }
+}
+
 Req* net_get(const char* url, size_t maxBytes, ReqDone done, void* ud)
 {
 	Req* r = pd->system->realloc(NULL, sizeof(Req));
 	memset(r, 0, sizeof *r);
 	snprintf(r->url, sizeof r->url, "%s", url);
 	r->max = maxBytes; r->done = done; r->ud = ud;
-	r->cap = 4096; r->buf = xrealloc(NULL, r->cap);
+	alloc_body(r);
+	if (!r->buf) { pd->system->realloc(r, 0); return NULL; }
 	if (!add_req(r)) return NULL;
 	if (!connect_req(r)) { r->status = -1; r->finished = true; }
 	return r;
@@ -119,7 +128,8 @@ Req* net_post(const char* url, const char* jsonBody, size_t maxBytes, ReqDone do
 	r->postLen = strlen(jsonBody);
 	r->postBody = xrealloc(NULL, r->postLen + 1);
 	memcpy(r->postBody, jsonBody, r->postLen + 1);
-	r->cap = 4096; r->buf = xrealloc(NULL, r->cap);
+	alloc_body(r);
+	if (!r->buf) { xrealloc(r->postBody, 0); pd->system->realloc(r, 0); return NULL; }
 	if (!add_req(r)) return NULL;
 	if (!connect_req(r)) { r->status = -1; r->finished = true; }
 	return r;
@@ -272,7 +282,9 @@ static void pump(Req* r)
 		} else {
 			if (r->len + n + 1 > r->cap) {
 				while (r->len + n + 1 > r->cap) r->cap *= 2;
-				r->buf = xrealloc(r->buf, r->cap);
+				char* nb = xrealloc(r->buf, r->cap);
+				if (!nb) { fail(r, "out of memory"); return; }
+				r->buf = nb;
 			}
 			memcpy(r->buf + r->len, tmp, n);
 			r->len += n;

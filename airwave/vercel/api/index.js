@@ -7,7 +7,7 @@ const fs = require("fs");
 
 const FFMPEG = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const TOKEN = process.env.AIRWAVE_TOKEN || "";
-const UA = "AirwaveRelay/2.8";
+const UA = "AirwaveRelay/2.9";
 const W = 400, H = 240, STRIDE = 52, FPS = 15, SRC_ROW = 50, KEY_EVERY = 90;
 
 const FREE_LIVE = [
@@ -98,12 +98,17 @@ async function probe(url) {
   alive.set(url, { t: Date.now(), ok });
   return ok;
 }
-async function livePage(rows, off, per) {
-  const out = []; let i = off;
-  while (out.length < per && i < rows.length) {
+async function livePage(rows, off, rowFn, budget = BUDGET) {
+  const out = []; let i = off, size = 2, full = false;
+  while (!full && i < rows.length) {
     const batch = rows.slice(i, i + 48);
     const res = await Promise.all(batch.map((c) => probe(c.url)));
-    for (let k = 0; k < batch.length && out.length < per; k++) { i++; if (res[k]) out.push(batch[k]); }
+    for (let k = 0; k < batch.length; k++) {
+      if (!res[k]) { i++; continue; }
+      const n = JSON.stringify(rowFn(batch[k])).length + 1;
+      if (out.length && size + n > budget) { full = true; break; }
+      out.push(batch[k]); size += n; i++;
+    }
   }
   return { out, next: i, left: rows.length - i };
 }
@@ -111,10 +116,10 @@ const b64u = (s) => Buffer.from(s).toString("base64url");
 const iptvRow = (c) => ({ name: c.name.slice(0, 78), sub: (c.group || "").slice(0, 50), path: `/iptv/audio/${b64u(c.url)}`, video: `/iptv/video/${b64u(c.url)}` });
 
 async function iaList(q, page = 1) {
-  const url = "https://archive.org/advancedsearch.php?" + new URLSearchParams([["q", `(${q}) AND mediatype:movies`], ["fl[]", "identifier"], ["fl[]", "title"], ["fl[]", "creator"], ["rows", "30"], ["page", String(page)], ["sort[]", "downloads desc"], ["output", "json"]]);
+  const url = "https://archive.org/advancedsearch.php?" + new URLSearchParams([["q", `(${q}) AND mediatype:movies`], ["fl[]", "identifier"], ["fl[]", "title"], ["fl[]", "creator"], ["rows", "12"], ["page", String(page)], ["sort[]", "downloads desc"], ["output", "json"]]);
   const docs = (await getJson(url)).response.docs;
   const items = docs.map((d) => ({ name: String(d.title || d.identifier).slice(0, 90), sub: typeof d.creator === "string" ? d.creator.slice(0, 50) : "", path: `/ia/audio/${d.identifier}`, video: `/ia/video/${d.identifier}` }));
-  if (docs.length === 30) items.push({ name: "More...", path: "/ia/search?" + new URLSearchParams({ q, page: String(page + 1) }), kind: "list" });
+  if (docs.length === 12) items.push({ name: "More...", path: "/ia/search?" + new URLSearchParams({ q, page: String(page + 1) }), kind: "list" });
   return items;
 }
 async function iaMediaUrl(id) {
@@ -302,10 +307,23 @@ async function stt(req, res, q) {
 }
 
 // ---------- routing ----------
-const json = (res, code, obj) => { const b = JSON.stringify(obj); res.writeHead(code, { "content-type": "application/json", "content-length": Buffer.byteLength(b) }); res.end(b); };
-const page = (rows, off, params, base, per = 39) => {
-  const out = rows.slice(off, off + per);
-  if (off + per < rows.length) out.push({ name: `More... (${rows.length - off - per} left)`, path: base + "?" + new URLSearchParams({ ...params, offset: String(off + per) }), kind: "list" });
+// The Playdate's network chip copes badly with big single TLS records, so answers go out in small writes (it streams fine that way).
+const sendSmall = (res, code, buf, type) => {
+  res.writeHead(code, { "content-type": type, "content-length": buf.length, "cache-control": "no-store" });
+  for (let o = 0; o < buf.length; o += 700) res.write(buf.subarray(o, o + 700));
+  res.end();
+};
+const json = (res, code, obj) => sendSmall(res, code, Buffer.from(JSON.stringify(obj)), "application/json; charset=utf-8");
+// lists are cut by size, not count: a page stays under ~3 KB so it arrives in one go on the device
+const BUDGET = 3000;
+const pageBytes = (rows, off, params, base, budget = BUDGET) => {
+  const out = []; let size = 2, i = off;
+  while (i < rows.length && out.length < 39) {
+    const n = JSON.stringify(rows[i]).length + 1;
+    if (out.length && size + n > budget) break;
+    out.push(rows[i]); size += n; i++;
+  }
+  if (i < rows.length) out.push({ name: `More... (${rows.length - i} left)`, path: base + "?" + new URLSearchParams({ ...params, offset: String(i) }), kind: "list" });
   return out;
 };
 
@@ -315,8 +333,18 @@ module.exports = async (req, res) => {
     const q = u.searchParams;
     if (TOKEN && q.get("k") !== TOKEN) return json(res, 403, { error: "bad token" });
     const p = u.pathname;
-    if (p === "/health") return json(res, 200, { ok: true, version: "2.8", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no", stt: process.env.CF_API_TOKEN ? "cloudflare" : process.env.AI_GATEWAY_API_KEY ? "gateway" : "no" });
+    if (p === "/health") return json(res, 200, { ok: true, version: "2.9", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no", stt: process.env.CF_API_TOKEN ? "cloudflare" : process.env.AI_GATEWAY_API_KEY ? "gateway" : "no" });
     if (p === "/chat" && req.method === "POST") return await chat(req, res);
+    if (p === "/p") {                                  // fetch a public URL for the Playdate and hand it back in small writes
+      const target = q.get("u") || "", max = Math.min(Number(q.get("m")) || 200000, 600000);
+      if (!/^https?:\/\//.test(target)) return json(res, 400, { error: "http(s) URLs only" });
+      const r = await fetch(target, { headers: { "user-agent": UA, accept: "*/*" }, signal: AbortSignal.timeout(25000) });
+      if (!r.ok) return json(res, r.status === 404 ? 404 : 502, { error: `The source answered HTTP ${r.status}` });
+      const rd = r.body.getReader(); const parts = []; let got = 0;
+      while (got < max) { const { done, value } = await rd.read(); if (done) break; parts.push(Buffer.from(value)); got += value.length; }
+      rd.cancel().catch(() => {});
+      return sendSmall(res, 200, Buffer.concat(parts).subarray(0, max), r.headers.get("content-type") || "application/octet-stream");
+    }
     if (p === "/stt" && req.method === "POST") return await stt(req, res, q);
     if (p === "/t.mp3") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamMp3(await lowVariant(s), res); }
     if (p === "/v") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamVideo(await lowVariant(s), res, q.get("fit")); }
@@ -336,13 +364,13 @@ module.exports = async (req, res) => {
     if (p === "/pluto/movies") {
       const off = Number(q.get("offset") || 0);
       const rows = (await plutoChannels()).filter((c) => ["Movies", "Westerns", "Sci-Fi"].includes(c.category) || /movie|cinema|film/i.test(c.name)).map((c) => ({ name: c.name, sub: c.category, path: `/pluto/audio/${c.slug}`, video: `/pluto/video/${c.slug}` }));
-      return json(res, 200, page(rows, off, {}, "/pluto/movies"));
+      return json(res, 200, pageBytes(rows, off, {}, "/pluto/movies"));
     }
     if (p === "/pluto/channels") {
       const cat = q.get("cat"), term = (q.get("q") || "").toLowerCase(), off = Number(q.get("offset") || 0);
       const rows = (await plutoChannels()).filter((c) => c.name.toLowerCase().includes(term) && (!cat || c.category === cat)).map((c) => ({ name: c.name, sub: c.category, path: `/pluto/audio/${c.slug}`, video: `/pluto/video/${c.slug}` }));
       const params = {}; for (const [k, v] of q) if (k !== "offset" && k !== "k") params[k] = v;
-      return json(res, 200, page(rows, off, params, "/pluto/channels"));
+      return json(res, 200, pageBytes(rows, off, params, "/pluto/channels"));
     }
     if (p === "/ia/search") return json(res, 200, await iaList(q.get("q") || "", Number(q.get("page") || 1)));
     if (p.startsWith("/yt/") || p === "/tv/shows") return json(res, 501, { error: "YouTube isn't available on this host (YouTube blocks cloud servers)" });
@@ -355,7 +383,7 @@ module.exports = async (req, res) => {
       const group = q.get("group") || "", term = (q.get("q") || "").toLowerCase(), off = Number(q.get("offset") || 0);
       const rows = (await iptvChannels(group)).filter((c) => !term || c.name.toLowerCase().includes(term));
       const params = {}; for (const [k, v] of q) if (k !== "offset" && k !== "k") params[k] = v;
-      const pg = await livePage(rows, off, 30);
+      const pg = await livePage(rows, off, iptvRow);
       const items = pg.out.map(iptvRow);
       if (pg.left > 0) items.push({ name: `More... (${pg.left} to check)`, path: "/iptv/channels?" + new URLSearchParams({ ...params, offset: String(pg.next) }), kind: "list" });
       return json(res, 200, items);
