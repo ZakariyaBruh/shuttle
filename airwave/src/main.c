@@ -27,7 +27,7 @@ PlaydateAPI* pd;
 #define VQ_BYTES (160 * 1024)          /* cap on queued compressed frames: back-pressure instead of memory growth */
 #define FRAME_BYTES (LCD_ROWSIZE * 240)
 #define ENC_MAX (URL_MAX * 3)
-#define VERSION "2.5"
+#define VERSION "2.6"
 
 typedef enum { M_SPLASH, M_HOME, M_LIST, M_LOADING, M_MSG, M_TEXT, M_PLAY, M_VIDEO, M_CHAT, M_VOICE } Mode;
 typedef void (*Parser)(Req* r);

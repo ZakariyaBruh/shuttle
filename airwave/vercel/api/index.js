@@ -7,7 +7,7 @@ const fs = require("fs");
 
 const FFMPEG = process.env.FFMPEG_PATH || require("ffmpeg-static");
 const TOKEN = process.env.AIRWAVE_TOKEN || "";
-const UA = "AirwaveRelay/2.5";
+const UA = "AirwaveRelay/2.6";
 const W = 400, H = 240, STRIDE = 52, FPS = 15, SRC_ROW = 50, KEY_EVERY = 90;
 
 const FREE_LIVE = [
@@ -250,9 +250,37 @@ async function chat(req, res) {
 }
 
 // ---------- dictation: raw 16-bit mono PCM from the Playdate mic -> WAV -> AI Gateway transcription ----------
-async function stt(req, res, q) {
+// Transcription providers, first one configured wins: Cloudflare Workers AI (free daily allowance), then the Vercel AI Gateway.
+async function transcribe(wav) {
+  const cfId = process.env.CF_ACCOUNT_ID, cfTok = process.env.CF_API_TOKEN;
+  if (cfId && cfTok) {
+    const model = process.env.CF_STT_MODEL || "@cf/openai/whisper-large-v3-turbo";
+    const r = await fetch(`https://api.cloudflare.com/client/v4/accounts/${cfId}/ai/run/${model}`, {
+      method: "POST", signal: AbortSignal.timeout(40000),
+      headers: { authorization: `Bearer ${cfTok}`, "content-type": "application/json" },
+      body: JSON.stringify({ audio: wav.toString("base64") }),
+    });
+    const t = await r.text();
+    if (!r.ok) throw Object.assign(new Error(`Cloudflare transcription failed (HTTP ${r.status}).`), { detail: t.slice(0, 160) });
+    return String((JSON.parse(t).result || {}).text || "").trim();
+  }
   const key = process.env.AI_GATEWAY_API_KEY;
-  if (!key) return json(res, 501, { error: "Dictation needs the AI Gateway key set on the relay." });
+  if (key) {
+    const r = await fetch("https://ai-gateway.vercel.sh/v4/ai/transcription-model", {
+      method: "POST", signal: AbortSignal.timeout(40000),
+      headers: { authorization: `Bearer ${key}`, "ai-gateway-protocol-version": "0.0.1", "ai-transcription-model-specification-version": "4", "ai-model-id": process.env.AI_STT_MODEL || "openai/whisper-1", "content-type": "application/json" },
+      body: JSON.stringify({ audio: wav.toString("base64"), mediaType: "audio/wav" }),
+    });
+    const t = await r.text();
+    if (!r.ok) throw Object.assign(new Error(`Transcription failed (HTTP ${r.status}).`), { detail: t.slice(0, 160) });
+    try { return String(JSON.parse(t).text || "").trim(); } catch { return ""; }
+  }
+  return null;
+}
+
+// dictation: raw 16-bit mono PCM from the Playdate mic -> normalised WAV -> speech-to-text
+async function stt(req, res, q) {
+  if (!process.env.CF_API_TOKEN && !process.env.AI_GATEWAY_API_KEY) return json(res, 501, { error: "Dictation needs a speech-to-text key on the relay (Cloudflare Workers AI or the AI Gateway)." });
   const chunks = []; let n = 0;
   for await (const c of req) { n += c.length; if (n > 1.5e6) return json(res, 413, { error: "That recording was too long." }); chunks.push(c); }
   const pcm = Buffer.concat(chunks); const rate = Math.min(48000, Math.max(8000, Number(q.get("r")) || 11025));
@@ -264,15 +292,13 @@ async function stt(req, res, q) {
   wav.write("RIFF", 0); wav.writeUInt32LE(36 + count * 2, 4); wav.write("WAVEfmt ", 8); wav.writeUInt32LE(16, 16); wav.writeUInt16LE(1, 20); wav.writeUInt16LE(1, 22);
   wav.writeUInt32LE(rate, 24); wav.writeUInt32LE(rate * 2, 28); wav.writeUInt16LE(2, 32); wav.writeUInt16LE(16, 34); wav.write("data", 36); wav.writeUInt32LE(count * 2, 40);
   for (let i = 0; i < count; i++) wav.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(pcm.readInt16LE(i * 2) * gain))), 44 + i * 2);
-  const r = await fetch("https://ai-gateway.vercel.sh/v4/ai/transcription-model", {
-    method: "POST", signal: AbortSignal.timeout(40000),
-    headers: { authorization: `Bearer ${key}`, "ai-gateway-protocol-version": "0.0.1", "ai-transcription-model-specification-version": "4", "ai-model-id": process.env.AI_STT_MODEL || "openai/whisper-1", "content-type": "application/json" },
-    body: JSON.stringify({ audio: wav.toString("base64"), mediaType: "audio/wav" }),
-  });
-  const t = await r.text();
-  if (!r.ok) return json(res, 502, { error: `Transcription failed (HTTP ${r.status}).`, detail: t.slice(0, 160) });
-  let text = ""; try { text = String(JSON.parse(t).text || "").trim(); } catch {}
-  return json(res, 200, { text });
+  try {
+    const text = await transcribe(wav);
+    if (text === null) return json(res, 501, { error: "Set CF_ACCOUNT_ID and CF_API_TOKEN (or AI_GATEWAY_API_KEY) on the relay for dictation." });
+    return json(res, 200, { text });
+  } catch (e) {
+    return json(res, 502, { error: e.message, detail: e.detail || "" });
+  }
 }
 
 // ---------- routing ----------
@@ -289,7 +315,7 @@ module.exports = async (req, res) => {
     const q = u.searchParams;
     if (TOKEN && q.get("k") !== TOKEN) return json(res, 403, { error: "bad token" });
     const p = u.pathname;
-    if (p === "/health") return json(res, 200, { ok: true, version: "2.5", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no" });
+    if (p === "/health") return json(res, 200, { ok: true, version: "2.6", video: "yes", yt: "no", ffmpeg: "yes", region: process.env.VERCEL_REGION || "", chat: process.env.AI_GATEWAY_API_KEY ? "yes" : "no", stt: process.env.CF_API_TOKEN ? "cloudflare" : process.env.AI_GATEWAY_API_KEY ? "gateway" : "no" });
     if (p === "/chat" && req.method === "POST") return await chat(req, res);
     if (p === "/stt" && req.method === "POST") return await stt(req, res, q);
     if (p === "/t.mp3") { const s = q.get("u") || ""; if (!/^https?:/.test(s)) return json(res, 400, { error: "http(s) URLs only" }); return streamMp3(await lowVariant(s), res); }

@@ -45,18 +45,18 @@ rendition. `/health` reports what the relay can do (video / YouTube). `--token` 
 YouTube needs yt-dlp plus node or deno, and sometimes `--yt-cookies` (YouTube blocks data-centre IPs with a bot check; I could verify
 listings from my environment but **not YouTube playback**).
 
-### Vercel relay (v2.5)
+### Vercel relay (v2.6)
 `vercel/` is the same relay as one Vercel Function (Node + `ffmpeg-static`): deploy the folder, set `AIRWAVE_TOKEN` (and optionally
 `AI_GATEWAY_API_KEY` for AI chat), then enter `https://<project>.vercel.app` and the token in Setup (IPTV channels come from the free iptv-org lists, or your own playlist via `IPTV_URL`; this personal build has them baked in via `src/defaults.h`; Setup overrides). Verified live: audio, Pluto TV
 and free news channels, 1-bit video. YouTube does not work there (YouTube blocks cloud IPs). Hobby plan requests last at most 300 s;
 the app re-requests live streams automatically. Without a gateway key, chat falls back to the free Pollinations service.
 
-### Stream queue (v2.5)
+### Stream queue (v2.6)
 Starting a stream stops the old one, frees its buffers and waits ~320 ms; skipping quickly (Left/Right/Up/Down) collapses into one request.
 
-### Dictation and episode search (v2.5)
+### Dictation and episode search (v2.6)
 **Voice:** Search menu (home) -> "Speak a search", or press **Left** in AI chat. Press A, speak, it stops when you pause; the relay transcribes it
-(`/stt`, Whisper through the Vercel AI Gateway, so `AI_GATEWAY_API_KEY` must be set on the relay) and you confirm what it heard before it is used.
+(`/stt`; Whisper on Cloudflare Workers AI's free tier when `CF_ACCOUNT_ID` + `CF_API_TOKEN` (Workers AI permission) are set on the relay, otherwise through the Vercel AI Gateway with `AI_GATEWAY_API_KEY`) and you confirm what it heard before it is used.
 **Episodes:** Podcasts -> "Search episodes" finds episodes across every show; every episode list starts with "Search this show" (title filter over the
 newest part of the feed) and "Speak to search".
 
